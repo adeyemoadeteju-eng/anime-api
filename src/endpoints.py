@@ -817,6 +817,128 @@ def _load_tmdb_overrides():
         return {}
 
 
+def _tmdb_season_hints(title_data, candidate):
+    """Build distinctive title fragments that can identify a TMDB season."""
+    import re
+
+    raw_titles = [
+        title_data.get("english"),
+        title_data.get("romaji"),
+        title_data.get("native"),
+    ]
+    parent_titles = [
+        candidate.get("title"),
+        candidate.get("originalTitle"),
+    ]
+    hints = set()
+
+    for raw_title in raw_titles:
+        if not raw_title:
+            continue
+
+        normalized_title = _tmdb_normalize(raw_title)
+        if len(normalized_title) >= 5:
+            hints.add(normalized_title)
+
+        # Colon/dash-separated subtitles often name the season or story arc.
+        for part in re.split(r"[:：—–]", raw_title):
+            normalized_part = _tmdb_normalize(part)
+            if len(normalized_part) >= 5:
+                hints.add(normalized_part)
+
+        # Some anime titles append the parent franchise name without a
+        # separator, e.g. "Steel Ball Run JoJo's Bizarre Adventure".
+        for parent_title in parent_titles:
+            normalized_parent = _tmdb_normalize(parent_title)
+            if normalized_parent and normalized_parent in normalized_title:
+                remainder = normalized_title.replace(normalized_parent, "")
+                if len(remainder) >= 5:
+                    hints.add(remainder)
+
+        # Support common numbered season/part labels.
+        for match in re.finditer(
+            r"(?i)\b(?:season|part|cour|stage)\s*(\d+)|\b(\d+)(?:st|nd|rd|th)\s+(?:season|part|cour|stage)\b",
+            raw_title,
+        ):
+            number = match.group(1) or match.group(2)
+            hints.add("season" + number)
+            hints.add("part" + number)
+
+    return sorted(hints, key=len, reverse=True)
+
+
+def _tmdb_score_season(season, hints):
+    from difflib import SequenceMatcher
+
+    season_name = season.get("name") or ""
+    original_name = season.get("original_name") or ""
+    season_titles = [
+        _tmdb_normalize(season_name),
+        _tmdb_normalize(original_name),
+    ]
+
+    best = 0.0
+    for hint in hints:
+        for season_title in season_titles:
+            if not hint or not season_title:
+                continue
+            if hint == season_title:
+                best = max(best, 1.0)
+            elif len(hint) >= 5 and (
+                hint in season_title or season_title in hint
+            ):
+                shorter = min(len(hint), len(season_title))
+                longer = max(len(hint), len(season_title))
+                best = max(best, 0.94 + (0.05 * shorter / longer))
+            else:
+                best = max(best, SequenceMatcher(None, hint, season_title).ratio())
+
+    return best
+
+
+async def _tmdb_resolve_season(client, api_key, candidate, title_data):
+    """Return a season only when its TMDB name strongly matches the anime title."""
+    tmdb_id = candidate.get("tmdbId")
+    if not tmdb_id:
+        return None
+
+    try:
+        response = await client.get(
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}",
+            params={"api_key": api_key},
+        )
+        response.raise_for_status()
+        seasons = response.json().get("seasons", [])
+    except httpx.HTTPError:
+        return None
+
+    hints = _tmdb_season_hints(title_data, candidate)
+    ranked = []
+    for item in seasons:
+        season_number = item.get("season_number")
+        if season_number is None or int(season_number) <= 0:
+            continue
+
+        score = _tmdb_score_season(item, hints)
+        if score >= 0.93:
+            ranked.append({
+                "seasonNumber": int(season_number),
+                "name": item.get("name"),
+                "airDate": item.get("air_date"),
+                "episodeCount": item.get("episode_count"),
+                "score": round(score, 4),
+            })
+
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    if not ranked:
+        return None
+
+    if len(ranked) > 1 and ranked[0]["score"] - ranked[1]["score"] < 0.06:
+        return None
+
+    return ranked[0]
+
+
 @router.get("/tmdb-match/{anilist_id}")
 async def get_tmdb_matches(anilist_id: int):
     """Diagnostic search: returns ranked TMDB candidates and their available seasons."""
@@ -894,7 +1016,7 @@ async def get_tmdb_matches(anilist_id: int):
         "relations": relations,
         "candidates": candidates[:10],
         "configuredOverride": _load_tmdb_overrides().get(str(anilist_id)),
-        "note": "Candidates are diagnostic only. Configure an explicit verified override if the automatic result is ambiguous.",
+        "note": "For franchise entries, playback requires a TMDB season-name match; it will not fall back to Season 1 of a parent series.",
     }
 
 
@@ -948,12 +1070,14 @@ async def get_embed_playback(
         async with httpx.AsyncClient(timeout=15.0) as client:
             candidates = await _tmdb_candidates(client, api_key, kind, aliases, year)
 
-        # Prefer normalized exact title matches. If there are several,
-        # use the AniList year only when it clearly separates the choices.
+        # Exact title identity can select the series directly.
+        # Parent/franchise containment is NOT enough: it must also identify
+        # the correct named TMDB season (e.g. Steel Ball Run on the JoJo show).
         if candidates:
             exact_matches = [item for item in candidates if item.get("exactTitle")]
             if len(exact_matches) == 1:
                 tmdb_id = exact_matches[0]["tmdbId"]
+                season = 1
             elif len(exact_matches) > 1:
                 ranked_exact = sorted(
                     exact_matches,
@@ -963,32 +1087,53 @@ async def get_embed_playback(
                 second_delta = ranked_exact[1].get("yearDelta")
                 if first_delta is not None and (second_delta is None or second_delta - first_delta >= 2):
                     tmdb_id = ranked_exact[0]["tmdbId"]
+                    season = 1
 
-            # Franchise/arc titles often include the TMDB parent show name.
-            # Select a unique strong containment match without penalizing it
-            # for having a different premiere year.
+            # For sequel/arc entries, test the candidate's actual TMDB season
+            # names. Never silently fall back to Season 1 of its parent show.
             if not tmdb_id:
                 contained_matches = [
                     item for item in candidates
                     if item.get("containedTitle") and item["score"] >= 0.94
                 ]
-                if len(contained_matches) == 1:
-                    tmdb_id = contained_matches[0]["tmdbId"]
-                elif len(contained_matches) > 1:
-                    best_contained = contained_matches[0]
-                    second_contained = contained_matches[1]
-                    if best_contained["score"] - second_contained["score"] >= 0.06:
-                        tmdb_id = best_contained["tmdbId"]
+                season_matches = []
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    for candidate in contained_matches[:8]:
+                        matched_season = await _tmdb_resolve_season(
+                            client, api_key, candidate, title_data
+                        )
+                        if matched_season:
+                            season_matches.append((candidate, matched_season))
 
-            # Keep fuzzy matching conservative: a high score must also have
-            # a clear lead, unless it is the only high-confidence candidate.
+                season_matches.sort(
+                    key=lambda pair: pair[1]["score"],
+                    reverse=True,
+                )
+                if len(season_matches) == 1:
+                    tmdb_id = season_matches[0][0]["tmdbId"]
+                    season = season_matches[0][1]["seasonNumber"]
+                elif len(season_matches) > 1:
+                    best_candidate, best_season = season_matches[0]
+                    second_candidate, second_season = season_matches[1]
+                    if best_season["score"] - second_season["score"] >= 0.06:
+                        tmdb_id = best_candidate["tmdbId"]
+                        season = best_season["seasonNumber"]
+
+            # Fuzzy matches are allowed only when the candidate is not merely
+            # a parent franchise title. That parent case requires season proof.
             if not tmdb_id:
-                top = candidates[0]
-                second_score = candidates[1]["score"] if len(candidates) > 1 else 0
-                clearly_best = top["score"] >= 0.90 and (top["score"] - second_score) >= 0.08
-                single_strong = len(candidates) == 1 and top["score"] >= 0.93
-                if clearly_best or single_strong:
-                    tmdb_id = top["tmdbId"]
+                fuzzy_candidates = [
+                    item for item in candidates
+                    if not item.get("containedTitle")
+                ]
+                if fuzzy_candidates:
+                    top = fuzzy_candidates[0]
+                    second_score = fuzzy_candidates[1]["score"] if len(fuzzy_candidates) > 1 else 0
+                    clearly_best = top["score"] >= 0.90 and (top["score"] - second_score) >= 0.08
+                    single_strong = len(fuzzy_candidates) == 1 and top["score"] >= 0.93
+                    if clearly_best or single_strong:
+                        tmdb_id = top["tmdbId"]
+                        season = 1
 
     if not tmdb_id:
         print(
@@ -1010,7 +1155,7 @@ async def get_embed_playback(
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "TMDB match is ambiguous; no title was selected automatically.",
+                "message": "TMDB could not confidently identify the correct show and season; playback was not started.",
                 "candidates": candidates[:8],
                 "anilistTitles": titles,
                 "year": year,
