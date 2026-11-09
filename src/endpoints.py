@@ -687,57 +687,86 @@ def _tmdb_normalize(value):
     import re
     import unicodedata
     value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
-    # TMDB commonly appends a premiere year to a title; compare the title
-    # itself separately so "Series" and "Series (2012)" can match.
-    value = re.sub(r"\\s*\\((?:19|20)\\d{2}\\)\\s*$", "", value)
+    # Remove a year suffix such as "(2012)" before comparing title strings.
+    value = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", value)
     return re.sub(r"[^a-z0-9]+", "", value)
 
 
 def _tmdb_title_aliases(title_data):
+    import re
     titles = []
     for value in (title_data.get("english"), title_data.get("romaji"), title_data.get("native")):
         if value and value not in titles:
             titles.append(value)
+
     aliases = list(titles)
     for value in titles:
-        for separator in (":", "：", "—", "–", " - "):
+        # Subtitle separators can produce useful alternate search names.
+        # Avoid splitting on a plain spaced hyphen: anime titles often use it
+        # for stage/episode labels, which creates weak aliases like "3rd Stage".
+        for separator in (":", "：", "—", "–"):
             if separator in value:
                 tail = value.rsplit(separator, 1)[-1].strip()
-                if len(tail) >= 4 and tail not in aliases:
+                if len(tail) >= 5 and not re.fullmatch(
+                    r"(?i)(?:\d+(?:st|nd|rd|th)\s+)?(?:stage|season|part|cour|episode)\s*\d*",
+                    tail,
+                ) and tail not in aliases:
                     aliases.append(tail)
     return titles, aliases
 
 
 def _tmdb_score(item, aliases, year):
     from difflib import SequenceMatcher
+
     name = item.get("title") or item.get("name") or ""
     original = item.get("original_title") or item.get("original_name") or ""
     names = [_tmdb_normalize(name), _tmdb_normalize(original)]
+
     best = 0.0
     exact_title = False
+    contained_title = False
+
     for alias in aliases:
-        candidate = _tmdb_normalize(alias)
-        if not candidate:
+        normalized_alias = _tmdb_normalize(alias)
+        if not normalized_alias:
             continue
-        for value in names:
-            if not value:
+
+        for normalized_name in names:
+            if not normalized_name:
                 continue
-            if candidate == value:
+
+            if normalized_alias == normalized_name:
                 exact_title = True
                 best = max(best, 1.0)
                 continue
-            score = SequenceMatcher(None, candidate, value).ratio()
-            if len(candidate) >= 5 and (candidate in value or value in candidate):
-                score = max(score, 0.92)
-            best = max(best, score)
+
+            # The AniList title may contain the parent TMDB title, as with
+            # franchise/arc entries. Treat that as a strong title match.
+            shorter = min(len(normalized_alias), len(normalized_name))
+            longer = max(len(normalized_alias), len(normalized_name))
+            if shorter >= 7 and (
+                normalized_alias in normalized_name or normalized_name in normalized_alias
+            ):
+                contained_title = True
+                best = max(best, 0.94 + (0.04 * shorter / longer))
+                continue
+
+            best = max(best, SequenceMatcher(None, normalized_alias, normalized_name).ratio())
+
     date = item.get("release_date") or item.get("first_air_date") or ""
     item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
     year_delta = abs(item_year - year) if year and item_year else None
-    # A title-exact match stays strong even when AniList and TMDB use
-    # different premiere dates. Year is a tie-breaker, not a hard blocker.
-    if year_delta is not None and not exact_title:
-        best += 0.04 if year_delta == 0 else (0.015 if year_delta == 1 else -0.12)
-    return best, item_year, exact_title, year_delta
+
+    # Premiere year is only a tie-breaker. It must not cancel an exact or
+    # strong contained title match when AniList dates a sequel/arc separately.
+    if not exact_title and not contained_title and year_delta is not None:
+        if year_delta == 0:
+            best += 0.02
+        elif year_delta == 1:
+            best += 0.01
+
+    title_match = "exact" if exact_title else ("contained" if contained_title else "fuzzy")
+    return best, item_year, exact_title, contained_title, year_delta, title_match
 
 
 async def _tmdb_candidates(client, api_key, kind, aliases, year):
@@ -755,7 +784,7 @@ async def _tmdb_candidates(client, api_key, kind, aliases, year):
             tmdb_id = item.get("id")
             if not tmdb_id:
                 continue
-            score, item_year, exact_title, year_delta = _tmdb_score(item, aliases, year)
+            score, item_year, exact_title, contained_title, year_delta, title_match = _tmdb_score(item, aliases, year)
             existing = candidates.get(tmdb_id)
             candidate = {
                 "tmdbId": tmdb_id,
@@ -764,6 +793,8 @@ async def _tmdb_candidates(client, api_key, kind, aliases, year):
                 "year": item_year,
                 "score": round(score, 4),
                 "exactTitle": exact_title,
+                "containedTitle": contained_title,
+                "titleMatch": title_match,
                 "yearDelta": year_delta,
                 "overview": item.get("overview"),
                 "posterPath": item.get("poster_path"),
@@ -917,9 +948,8 @@ async def get_embed_playback(
         async with httpx.AsyncClient(timeout=15.0) as client:
             candidates = await _tmdb_candidates(client, api_key, kind, aliases, year)
 
-        # Exact normalized title matches are trusted even when premiere years
-        # differ between AniList and TMDB. If several exact matches exist, use
-        # the closest year only when it clearly separates the candidates.
+        # Prefer normalized exact title matches. If there are several,
+        # use the AniList year only when it clearly separates the choices.
         if candidates:
             exact_matches = [item for item in candidates if item.get("exactTitle")]
             if len(exact_matches) == 1:
@@ -934,18 +964,53 @@ async def get_embed_playback(
                 if first_delta is not None and (second_delta is None or second_delta - first_delta >= 2):
                     tmdb_id = ranked_exact[0]["tmdbId"]
 
+            # Franchise/arc titles often include the TMDB parent show name.
+            # Select a unique strong containment match without penalizing it
+            # for having a different premiere year.
+            if not tmdb_id:
+                contained_matches = [
+                    item for item in candidates
+                    if item.get("containedTitle") and item["score"] >= 0.94
+                ]
+                if len(contained_matches) == 1:
+                    tmdb_id = contained_matches[0]["tmdbId"]
+                elif len(contained_matches) > 1:
+                    best_contained = contained_matches[0]
+                    second_contained = contained_matches[1]
+                    if best_contained["score"] - second_contained["score"] >= 0.06:
+                        tmdb_id = best_contained["tmdbId"]
+
+            # Keep fuzzy matching conservative: a high score must also have
+            # a clear lead, unless it is the only high-confidence candidate.
             if not tmdb_id:
                 top = candidates[0]
                 second_score = candidates[1]["score"] if len(candidates) > 1 else 0
-                clearly_best = top["score"] >= 0.98 and (top["score"] - second_score) >= 0.08
-                if clearly_best:
+                clearly_best = top["score"] >= 0.90 and (top["score"] - second_score) >= 0.08
+                single_strong = len(candidates) == 1 and top["score"] >= 0.93
+                if clearly_best or single_strong:
                     tmdb_id = top["tmdbId"]
 
     if not tmdb_id:
+        print(
+            "[TMDB MATCH] no confident match for AniList",
+            anilist_id,
+            "titles=", titles,
+            "candidates=",
+            [
+                {
+                    "id": item.get("tmdbId"),
+                    "title": item.get("title"),
+                    "score": item.get("score"),
+                    "match": item.get("titleMatch"),
+                    "yearDelta": item.get("yearDelta"),
+                }
+                for item in candidates[:5]
+            ],
+        )
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "TMDB match needs a verified mapping; no title was selected automatically.",
+                "message": "TMDB match is ambiguous; no title was selected automatically.",
                 "candidates": candidates[:8],
                 "anilistTitles": titles,
                 "year": year,
