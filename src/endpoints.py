@@ -687,6 +687,9 @@ def _tmdb_normalize(value):
     import re
     import unicodedata
     value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
+    # TMDB commonly appends a premiere year to a title; compare the title
+    # itself separately so "Series" and "Series (2012)" can match.
+    value = re.sub(r"\\s*\\((?:19|20)\\d{2}\\)\\s*$", "", value)
     return re.sub(r"[^a-z0-9]+", "", value)
 
 
