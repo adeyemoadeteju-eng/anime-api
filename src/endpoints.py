@@ -767,3 +767,110 @@ async def get_tmdb_matches(anilist_id: int):
         "requiresSelection": len(matches) > 0,
         "note": "Choose the matching TMDB record; results are candidates, not a guaranteed ID match.",
     }
+
+
+@router.get("/playback/{anilist_id}")
+async def get_embed_playback(
+    anilist_id: int,
+    episode: int = Query(1, ge=1, le=1000),
+):
+    """Return HTTPS embed candidates after a conservative AniList-to-TMDB match."""
+    import os
+    import re
+    import unicodedata
+
+    api_key = os.getenv("TMDB_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
+
+    gql = """
+    query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            idMal
+            format
+            title { romaji english }
+            startDate { year }
+        }
+    }
+    """
+    data = await anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="anime not found")
+
+    title_data = media.get("title") or {}
+    titles = [v for v in (title_data.get("english"), title_data.get("romaji")) if v]
+    if not titles:
+        raise HTTPException(status_code=404, detail="anime has no searchable title")
+
+    def normalize(value):
+        value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
+        return re.sub(r"[^a-z0-9]+", "", value)
+
+    year = (media.get("startDate") or {}).get("year")
+    is_movie = media.get("format") == "MOVIE"
+    kind = "movie" if is_movie else "tv"
+    matches = {}
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for title in titles:
+            params = {"api_key": api_key, "query": title, "include_adult": "false"}
+            if year:
+                params["year" if is_movie else "first_air_date_year"] = year
+            try:
+                response = await client.get(f"https://api.themoviedb.org/3/search/{kind}", params=params)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HTTPException(status_code=502, detail=f"TMDB search failed with status {exc.response.status_code}")
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="could not reach TMDB")
+            for item in response.json().get("results", []):
+                name = item.get("title") or item.get("name") or ""
+                original = item.get("original_title") or item.get("original_name") or ""
+                date = item.get("release_date") or item.get("first_air_date") or ""
+                item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+                exact_title = any(normalize(candidate) in {normalize(name), normalize(original)} for candidate in titles)
+                exact_year = not year or item_year == year
+                if exact_title and exact_year and item.get("id"):
+                    matches[item["id"]] = {
+                        "tmdbId": item["id"],
+                        "title": name,
+                        "year": item_year,
+                        "overview": item.get("overview"),
+                    }
+
+    if len(matches) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "TMDB match is not unique; refusing to play the wrong title.",
+                "candidates": list(matches.values())[:8],
+                "anilistTitles": titles,
+                "year": year,
+            },
+        )
+
+    tmdb_id = next(iter(matches))
+    if is_movie:
+        embeds = [
+            {"name": "VidSrc", "url": f"https://vidsrc.mov/embed/movie/{tmdb_id}"},
+            {"name": "VidCore", "url": f"https://vidcore.org/embed/movie/{tmdb_id}"},
+            {"name": "2Embed", "url": f"https://www.2embed.cc/embed/{tmdb_id}"},
+            {"name": "VidLink", "url": f"https://vidlink.pro/movie/{tmdb_id}"},
+        ]
+    else:
+        embeds = [
+            {"name": "VidSrc", "url": f"https://vidsrc.mov/embed/tv/{tmdb_id}/1/{episode}"},
+            {"name": "VidCore", "url": f"https://vidcore.org/embed/series/{tmdb_id}/1/{episode}"},
+            {"name": "2Embed", "url": f"https://www.2embed.cc/embedtv/{tmdb_id}&s=1&e={episode}"},
+            {"name": "VidLink", "url": f"https://vidlink.pro/tv/{tmdb_id}/1/{episode}"},
+        ]
+
+    return {
+        "anilistId": anilist_id,
+        "malId": media.get("idMal"),
+        "tmdbId": tmdb_id,
+        "episode": 1 if is_movie else episode,
+        "mediaType": kind,
+        "sources": embeds,
+    }
