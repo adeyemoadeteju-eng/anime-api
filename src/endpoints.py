@@ -683,11 +683,103 @@ async def extract_simple(
     raise HTTPException(status_code=500, detail=f"all providers failed. last error: {last_error}")
 
 
+def _tmdb_normalize(value):
+    import re
+    import unicodedata
+    value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def _tmdb_title_aliases(title_data):
+    titles = []
+    for value in (title_data.get("english"), title_data.get("romaji"), title_data.get("native")):
+        if value and value not in titles:
+            titles.append(value)
+    aliases = list(titles)
+    for value in titles:
+        for separator in (":", "：", "—", "–", " - "):
+            if separator in value:
+                tail = value.rsplit(separator, 1)[-1].strip()
+                if len(tail) >= 4 and tail not in aliases:
+                    aliases.append(tail)
+    return titles, aliases
+
+
+def _tmdb_score(item, aliases, year):
+    from difflib import SequenceMatcher
+    name = item.get("title") or item.get("name") or ""
+    original = item.get("original_title") or item.get("original_name") or ""
+    names = [_tmdb_normalize(name), _tmdb_normalize(original)]
+    best = 0.0
+    for alias in aliases:
+        candidate = _tmdb_normalize(alias)
+        if not candidate:
+            continue
+        for value in names:
+            if not value:
+                continue
+            score = SequenceMatcher(None, candidate, value).ratio()
+            if candidate == value:
+                score = 1.0
+            elif len(candidate) >= 5 and (candidate in value or value in candidate):
+                score = max(score, 0.92)
+            best = max(best, score)
+    date = item.get("release_date") or item.get("first_air_date") or ""
+    item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+    if year and item_year:
+        delta = abs(item_year - year)
+        best += 0.04 if delta == 0 else (0.015 if delta == 1 else -0.12)
+    return best, item_year
+
+
+async def _tmdb_candidates(client, api_key, kind, aliases, year):
+    candidates = {}
+    for title in aliases:
+        params = {"api_key": api_key, "query": title, "include_adult": "false"}
+        try:
+            response = await client.get(f"https://api.themoviedb.org/3/search/{kind}", params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(status_code=502, detail=f"TMDB search failed with status {exc.response.status_code}")
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="could not reach TMDB")
+        for item in response.json().get("results", []):
+            tmdb_id = item.get("id")
+            if not tmdb_id:
+                continue
+            score, item_year = _tmdb_score(item, aliases, year)
+            existing = candidates.get(tmdb_id)
+            candidate = {
+                "tmdbId": tmdb_id,
+                "title": item.get("title") or item.get("name"),
+                "originalTitle": item.get("original_title") or item.get("original_name"),
+                "year": item_year,
+                "score": round(score, 4),
+                "overview": item.get("overview"),
+                "posterPath": item.get("poster_path"),
+            }
+            if not existing or candidate["score"] > existing["score"]:
+                candidates[tmdb_id] = candidate
+    return sorted(candidates.values(), key=lambda item: item["score"], reverse=True)
+
+
+def _load_tmdb_overrides():
+    """Optional verified mappings, configured as JSON in ANIME_TMDB_OVERRIDES."""
+    import json
+    import os
+    raw = os.getenv("ANIME_TMDB_OVERRIDES", "{}")
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        print("[TMDB] ANIME_TMDB_OVERRIDES is invalid JSON; ignoring overrides")
+        return {}
+
+
 @router.get("/tmdb-match/{anilist_id}")
 async def get_tmdb_matches(anilist_id: int):
-    """Find possible TMDB records for an AniList anime without guessing a match."""
+    """Diagnostic search: returns ranked TMDB candidates and their available seasons."""
     import os
-
     api_key = os.getenv("TMDB_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
@@ -695,11 +787,15 @@ async def get_tmdb_matches(anilist_id: int):
     gql = """
     query ($id: Int) {
         Media(id: $id, type: ANIME) {
-            id
-            idMal
-            format
+            id idMal format
             title { romaji english native }
             startDate { year }
+            relations {
+                edges {
+                    relationType(version: 2)
+                    node { id idMal format title { romaji english native } startDate { year } }
+                }
+            }
         }
     }
     """
@@ -709,63 +805,55 @@ async def get_tmdb_matches(anilist_id: int):
         raise HTTPException(status_code=404, detail="anime not found")
 
     title_data = media.get("title") or {}
-    titles = []
-    for value in (title_data.get("english"), title_data.get("romaji")):
-        if value and value not in titles:
-            titles.append(value)
-    if not titles:
-        raise HTTPException(status_code=404, detail="anime has no searchable title")
-
-    media_format = media.get("format")
-    endpoint = "movie" if media_format == "MOVIE" else "tv"
+    titles, aliases = _tmdb_title_aliases(title_data)
     year = (media.get("startDate") or {}).get("year")
-    matches = []
-    seen_ids = set()
+    kind = "movie" if media.get("format") == "MOVIE" else "tv"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        candidates = await _tmdb_candidates(client, api_key, kind, aliases, year)
+        if kind == "tv":
+            for candidate in candidates[:8]:
+                try:
+                    detail = await client.get(
+                        f"https://api.themoviedb.org/3/tv/{candidate['tmdbId']}",
+                        params={"api_key": api_key},
+                    )
+                    detail.raise_for_status()
+                    candidate["seasons"] = [
+                        {
+                            "seasonNumber": season.get("season_number"),
+                            "name": season.get("name"),
+                            "airDate": season.get("air_date"),
+                            "episodeCount": season.get("episode_count"),
+                        }
+                        for season in detail.json().get("seasons", [])
+                    ]
+                except httpx.HTTPError:
+                    candidate["seasons"] = []
 
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        for title in titles:
-            params = {"api_key": api_key, "query": title, "include_adult": "false"}
-            if year:
-                params["year" if endpoint == "movie" else "first_air_date_year"] = year
-            try:
-                response = await client.get(
-                    f"https://api.themoviedb.org/3/search/{endpoint}",
-                    params=params,
-                )
-                response.raise_for_status()
-                payload = response.json()
-            except httpx.HTTPStatusError as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"TMDB search failed with status {exc.response.status_code}",
-                )
-            except httpx.HTTPError:
-                raise HTTPException(status_code=502, detail="could not reach TMDB")
-
-            for item in payload.get("results", []):
-                tmdb_id = item.get("id")
-                if not tmdb_id or tmdb_id in seen_ids:
-                    continue
-                seen_ids.add(tmdb_id)
-                matches.append({
-                    "tmdbId": tmdb_id,
-                    "title": item.get("title") or item.get("name"),
-                    "originalTitle": item.get("original_title") or item.get("original_name"),
-                    "releaseDate": item.get("release_date") or item.get("first_air_date"),
-                    "overview": item.get("overview"),
-                    "posterPath": item.get("poster_path"),
-                    "mediaType": endpoint,
-                })
+    relations = []
+    for edge in (media.get("relations") or {}).get("edges", []):
+        node = edge.get("node") or {}
+        relations.append({
+            "relation": edge.get("relationType"),
+            "id": node.get("id"),
+            "idMal": node.get("idMal"),
+            "format": node.get("format"),
+            "title": node.get("title"),
+            "year": (node.get("startDate") or {}).get("year"),
+        })
 
     return {
         "anilistId": media["id"],
         "malId": media.get("idMal"),
         "anilistTitle": title_data,
-        "format": media_format,
+        "titlesSearched": aliases,
+        "format": media.get("format"),
         "year": year,
-        "matches": matches[:10],
-        "requiresSelection": len(matches) > 0,
-        "note": "Choose the matching TMDB record; results are candidates, not a guaranteed ID match.",
+        "mediaType": kind,
+        "relations": relations,
+        "candidates": candidates[:10],
+        "configuredOverride": _load_tmdb_overrides().get(str(anilist_id)),
+        "note": "Candidates are diagnostic only. Configure an explicit verified override if the automatic result is ambiguous.",
     }
 
 
@@ -774,11 +862,8 @@ async def get_embed_playback(
     anilist_id: int,
     episode: int = Query(1, ge=1, le=1000),
 ):
-    """Return HTTPS embed candidates after a conservative AniList-to-TMDB match."""
+    """Return embed candidates using verified overrides or an unambiguous ranked TMDB match."""
     import os
-    import re
-    import unicodedata
-
     api_key = os.getenv("TMDB_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
@@ -786,9 +871,7 @@ async def get_embed_playback(
     gql = """
     query ($id: Int) {
         Media(id: $id, type: ANIME) {
-            id
-            idMal
-            format
+            id idMal format
             title { romaji english native }
             startDate { year }
         }
@@ -800,109 +883,52 @@ async def get_embed_playback(
         raise HTTPException(status_code=404, detail="anime not found")
 
     title_data = media.get("title") or {}
-    titles = []
-    for value in (title_data.get("english"), title_data.get("romaji"), title_data.get("native")):
-        if value and value not in titles:
-            titles.append(value)
-    # Anime databases often include the franchise name before a colon or dash.
-    # Search the distinctive subtitle too (e.g. "Steel Ball Run").
-    aliases = list(titles)
-    for value in titles:
-        for separator in (":", "：", "—", "–", " - "):
-            if separator in value:
-                tail = value.rsplit(separator, 1)[-1].strip()
-                if len(tail) >= 5 and tail not in aliases:
-                    aliases.append(tail)
-    if not aliases:
-        raise HTTPException(status_code=404, detail="anime has no searchable title")
-
-    def normalize(value):
-        value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
-        return re.sub(r"[^a-z0-9]+", "", value)
-
+    titles, aliases = _tmdb_title_aliases(title_data)
     year = (media.get("startDate") or {}).get("year")
     is_movie = media.get("format") == "MOVIE"
     kind = "movie" if is_movie else "tv"
-    matches = {}
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        for title in aliases:
-            # First use the known release year; only broaden the year if no safe
-            # result is found after all exact-year title searches.
-            params = {"api_key": api_key, "query": title, "include_adult": "false"}
-            if year:
-                params["year" if is_movie else "first_air_date_year"] = year
-            try:
-                response = await client.get(f"https://api.themoviedb.org/3/search/{kind}", params=params)
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise HTTPException(status_code=502, detail=f"TMDB search failed with status {exc.response.status_code}")
-            except httpx.HTTPError:
-                raise HTTPException(status_code=502, detail="could not reach TMDB")
-            for item in response.json().get("results", []):
-                name = item.get("title") or item.get("name") or ""
-                original = item.get("original_title") or item.get("original_name") or ""
-                date = item.get("release_date") or item.get("first_air_date") or ""
-                item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
-                normalized_names = (normalize(name), normalize(original))
-                exact_title = any(
-                    normalize(candidate) in normalized_names
-                    or (len(normalize(candidate)) >= 7 and any(normalize(candidate) in n for n in normalized_names))
-                    for candidate in aliases
-                )
-                exact_year = not year or item_year == year
-                if exact_title and exact_year and item.get("id"):
-                    matches[item["id"]] = {
-                        "tmdbId": item["id"],
-                        "title": name,
-                        "year": item_year,
-                        "overview": item.get("overview"),
-                    }
 
-    # If AniList's year is off by one (common for delayed premieres), retry
-    # only when the exact-year pass found nothing, and still require a title match.
-    if not matches and year:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            for title in aliases:
-                params = {"api_key": api_key, "query": title, "include_adult": "false"}
-                try:
-                    response = await client.get(f"https://api.themoviedb.org/3/search/{kind}", params=params)
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    raise HTTPException(status_code=502, detail=f"TMDB search failed with status {exc.response.status_code}")
-                except httpx.HTTPError:
-                    raise HTTPException(status_code=502, detail="could not reach TMDB")
-                for item in response.json().get("results", []):
-                    name = item.get("title") or item.get("name") or ""
-                    original = item.get("original_title") or item.get("original_name") or ""
-                    date = item.get("release_date") or item.get("first_air_date") or ""
-                    item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
-                    normalized_names = (normalize(name), normalize(original))
-                    title_match = any(
-                        normalize(candidate) in normalized_names
-                        or (len(normalize(candidate)) >= 7 and any(normalize(candidate) in n for n in normalized_names))
-                        for candidate in aliases
-                    )
-                    year_close = item_year is not None and abs(item_year - year) <= 1
-                    if title_match and year_close and item.get("id"):
-                        matches[item["id"]] = {
-                            "tmdbId": item["id"],
-                            "title": name,
-                            "year": item_year,
-                            "overview": item.get("overview"),
-                        }
+    override = _load_tmdb_overrides().get(str(anilist_id))
+    tmdb_id = None
+    season = 1
+    episode_offset = 0
+    if isinstance(override, dict) and override.get("tmdbId"):
+        try:
+            tmdb_id = int(override["tmdbId"])
+            season = int(override.get("season", 1))
+            episode_offset = int(override.get("episodeOffset", 0))
+            if season < 0 or episode_offset < 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=500, detail=f"Invalid TMDB override configured for AniList ID {anilist_id}")
 
-    if len(matches) != 1:
+    candidates = []
+    if not tmdb_id:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            candidates = await _tmdb_candidates(client, api_key, kind, aliases, year)
+
+        # Require an exact title or a very strong top score with a clear margin.
+        if candidates:
+            top = candidates[0]
+            second_score = candidates[1]["score"] if len(candidates) > 1 else 0
+            exact = top["score"] >= (1.04 if year else 1.0)
+            clearly_best = top["score"] >= 0.98 and (top["score"] - second_score) >= 0.08
+            if exact or clearly_best:
+                tmdb_id = top["tmdbId"]
+
+    if not tmdb_id:
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "TMDB match is not unique; refusing to play the wrong title.",
-                "candidates": list(matches.values())[:8],
+                "message": "TMDB match needs a verified mapping; no title was selected automatically.",
+                "candidates": candidates[:8],
                 "anilistTitles": titles,
                 "year": year,
+                "anilistId": anilist_id,
             },
         )
 
-    tmdb_id = next(iter(matches))
+    mapped_episode = 1 if is_movie else episode + episode_offset
     if is_movie:
         embeds = [
             {"name": "VidSrc", "url": f"https://vidsrc.mov/embed/movie/{tmdb_id}"},
@@ -912,18 +938,20 @@ async def get_embed_playback(
         ]
     else:
         embeds = [
-            {"name": "VidSrc", "url": f"https://vidsrc.mov/embed/tv/{tmdb_id}/1/{episode}"},
-            {"name": "VidCore", "url": f"https://vidcore.org/embed/tv/{tmdb_id}/1/{episode}"},
-            {"name": "VidCore (series route fallback)", "url": f"https://vidcore.org/embed/series/{tmdb_id}/1/{episode}"},
-            {"name": "2Embed", "url": f"https://www.2embed.cc/embedtv/{tmdb_id}&s=1&e={episode}"},
-            {"name": "VidLink", "url": f"https://vidlink.pro/tv/{tmdb_id}/1/{episode}"},
+            {"name": "VidSrc", "url": f"https://vidsrc.mov/embed/tv/{tmdb_id}/{season}/{mapped_episode}"},
+            {"name": "VidCore", "url": f"https://vidcore.org/embed/tv/{tmdb_id}/{season}/{mapped_episode}"},
+            {"name": "VidCore (series route fallback)", "url": f"https://vidcore.org/embed/series/{tmdb_id}/{season}/{mapped_episode}"},
+            {"name": "2Embed", "url": f"https://www.2embed.cc/embedtv/{tmdb_id}&s={season}&e={mapped_episode}"},
+            {"name": "VidLink", "url": f"https://vidlink.pro/tv/{tmdb_id}/{season}/{mapped_episode}"},
         ]
 
     return {
         "anilistId": anilist_id,
         "malId": media.get("idMal"),
         "tmdbId": tmdb_id,
-        "episode": 1 if is_movie else episode,
+        "season": season,
+        "episode": mapped_episode,
         "mediaType": kind,
+        "mappingSource": "verified-override" if override else "automatic",
         "sources": embeds,
     }
