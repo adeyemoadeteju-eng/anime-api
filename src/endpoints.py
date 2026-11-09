@@ -840,8 +840,19 @@ def _tmdb_season_hints(title_data, candidate):
         if len(normalized_title) >= 5:
             hints.add(normalized_title)
 
+        # Remove catalog suffixes such as "2nd - 3rd STAGE" before
+        # comparing the story-arc title to TMDB season names.
+        title_without_stage = re.sub(
+            r"(?i)\s+\d+(?:st|nd|rd|th)\s*(?:[-–—]\s*\d+(?:st|nd|rd|th)\s*)?(?:stage|season|part|cour)\s*\d*\s*$",
+            "",
+            raw_title,
+        ).strip()
+        clean_normalized = _tmdb_normalize(title_without_stage)
+        if len(clean_normalized) >= 5:
+            hints.add(clean_normalized)
+
         # Colon/dash-separated subtitles often name the season or story arc.
-        for part in re.split(r"[:：—–]", raw_title):
+        for part in re.split(r"[:：—–]", title_without_stage):
             normalized_part = _tmdb_normalize(part)
             if len(normalized_part) >= 5:
                 hints.add(normalized_part)
@@ -850,10 +861,11 @@ def _tmdb_season_hints(title_data, candidate):
         # separator, e.g. "Steel Ball Run JoJo's Bizarre Adventure".
         for parent_title in parent_titles:
             normalized_parent = _tmdb_normalize(parent_title)
-            if normalized_parent and normalized_parent in normalized_title:
-                remainder = normalized_title.replace(normalized_parent, "")
-                if len(remainder) >= 5:
-                    hints.add(remainder)
+            for source_title in (normalized_title, clean_normalized):
+                if normalized_parent and normalized_parent in source_title:
+                    remainder = source_title.replace(normalized_parent, "")
+                    if len(remainder) >= 5:
+                        hints.add(remainder)
 
         # Support common numbered season/part labels.
         for match in re.finditer(
