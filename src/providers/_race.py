@@ -11,6 +11,8 @@ RANKING = [
 
 WATCH_TIMEOUT = 75.0
 EPISODES_TIMEOUT = 60.0
+EPISODES_TOTAL_TIMEOUT = 25.0
+EPISODES_MERGE_GRACE = 1.5
 WATCH_CACHE_TTL = 45.0
 
 _latency: dict = {}
@@ -72,7 +74,7 @@ async def _watch_one(mod, name, anilist_id, ep, audio, ctx):
             _watch_cache[key] = (time.time() + WATCH_CACHE_TTL, streams)
             return name, streams, dt, True
         return name, None, dt, False
-    except Exception as e:
+    except Exception:
         return name, None, round(time.time() - t0, 3), False
 
 
@@ -111,7 +113,6 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
             if winner is not None:
                 break
     finally:
-
         if pending:
             try:
                 done2, pending2 = await asyncio.wait(pending, timeout=8.0)
@@ -153,10 +154,52 @@ async def merged_episodes(anilist_id: int) -> dict | None:
     mods = providers()
     if not mods:
         return None
+
     ctx = await build_ctx(anilist_id)
-    results = await asyncio.gather(
-        *[_episodes_one(mod, name, anilist_id, ctx) for name, mod in mods])
-    merged = {name: data for name, data in results if data}
+    pending = {
+        asyncio.create_task(_episodes_one(mod, name, anilist_id, ctx))
+        for name, mod in mods
+    }
+    merged: dict = {}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + EPISODES_TOTAL_TIMEOUT
+    merge_deadline = None
+
+    try:
+        while pending:
+            now = loop.time()
+            active_deadline = merge_deadline if merge_deadline is not None else deadline
+            remaining = active_deadline - now
+            if remaining <= 0:
+                break
+
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+
+            for task in done:
+                try:
+                    name, data = task.result()
+                    if data:
+                        merged[name] = data
+                except Exception as e:
+                    print(f"[RACE] episode task failed: {str(e)[:120]}")
+
+            # Once one provider has valid episodes, allow a short window for
+            # other fast providers to contribute, rather than waiting for all.
+            if merged and merge_deadline is None:
+                merge_deadline = loop.time() + EPISODES_MERGE_GRACE
+
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     if not merged:
         return None
     return {"anilistId": anilist_id, "source": "native", "providers": merged}
