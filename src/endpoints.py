@@ -711,6 +711,7 @@ def _tmdb_score(item, aliases, year):
     original = item.get("original_title") or item.get("original_name") or ""
     names = [_tmdb_normalize(name), _tmdb_normalize(original)]
     best = 0.0
+    exact_title = False
     for alias in aliases:
         candidate = _tmdb_normalize(alias)
         if not candidate:
@@ -718,18 +719,22 @@ def _tmdb_score(item, aliases, year):
         for value in names:
             if not value:
                 continue
-            score = SequenceMatcher(None, candidate, value).ratio()
             if candidate == value:
-                score = 1.0
-            elif len(candidate) >= 5 and (candidate in value or value in candidate):
+                exact_title = True
+                best = max(best, 1.0)
+                continue
+            score = SequenceMatcher(None, candidate, value).ratio()
+            if len(candidate) >= 5 and (candidate in value or value in candidate):
                 score = max(score, 0.92)
             best = max(best, score)
     date = item.get("release_date") or item.get("first_air_date") or ""
     item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
-    if year and item_year:
-        delta = abs(item_year - year)
-        best += 0.04 if delta == 0 else (0.015 if delta == 1 else -0.12)
-    return best, item_year
+    year_delta = abs(item_year - year) if year and item_year else None
+    # A title-exact match stays strong even when AniList and TMDB use
+    # different premiere dates. Year is a tie-breaker, not a hard blocker.
+    if year_delta is not None and not exact_title:
+        best += 0.04 if year_delta == 0 else (0.015 if year_delta == 1 else -0.12)
+    return best, item_year, exact_title, year_delta
 
 
 async def _tmdb_candidates(client, api_key, kind, aliases, year):
@@ -747,7 +752,7 @@ async def _tmdb_candidates(client, api_key, kind, aliases, year):
             tmdb_id = item.get("id")
             if not tmdb_id:
                 continue
-            score, item_year = _tmdb_score(item, aliases, year)
+            score, item_year, exact_title, year_delta = _tmdb_score(item, aliases, year)
             existing = candidates.get(tmdb_id)
             candidate = {
                 "tmdbId": tmdb_id,
@@ -755,6 +760,8 @@ async def _tmdb_candidates(client, api_key, kind, aliases, year):
                 "originalTitle": item.get("original_title") or item.get("original_name"),
                 "year": item_year,
                 "score": round(score, 4),
+                "exactTitle": exact_title,
+                "yearDelta": year_delta,
                 "overview": item.get("overview"),
                 "posterPath": item.get("poster_path"),
             }
@@ -907,14 +914,29 @@ async def get_embed_playback(
         async with httpx.AsyncClient(timeout=15.0) as client:
             candidates = await _tmdb_candidates(client, api_key, kind, aliases, year)
 
-        # Require an exact title or a very strong top score with a clear margin.
+        # Exact normalized title matches are trusted even when premiere years
+        # differ between AniList and TMDB. If several exact matches exist, use
+        # the closest year only when it clearly separates the candidates.
         if candidates:
-            top = candidates[0]
-            second_score = candidates[1]["score"] if len(candidates) > 1 else 0
-            exact = top["score"] >= (1.04 if year else 1.0)
-            clearly_best = top["score"] >= 0.98 and (top["score"] - second_score) >= 0.08
-            if exact or clearly_best:
-                tmdb_id = top["tmdbId"]
+            exact_matches = [item for item in candidates if item.get("exactTitle")]
+            if len(exact_matches) == 1:
+                tmdb_id = exact_matches[0]["tmdbId"]
+            elif len(exact_matches) > 1:
+                ranked_exact = sorted(
+                    exact_matches,
+                    key=lambda item: item.get("yearDelta") if item.get("yearDelta") is not None else 999,
+                )
+                first_delta = ranked_exact[0].get("yearDelta")
+                second_delta = ranked_exact[1].get("yearDelta")
+                if first_delta is not None and (second_delta is None or second_delta - first_delta >= 2):
+                    tmdb_id = ranked_exact[0]["tmdbId"]
+
+            if not tmdb_id:
+                top = candidates[0]
+                second_score = candidates[1]["score"] if len(candidates) > 1 else 0
+                clearly_best = top["score"] >= 0.98 and (top["score"] - second_score) >= 0.08
+                if clearly_best:
+                    tmdb_id = top["tmdbId"]
 
     if not tmdb_id:
         raise HTTPException(
