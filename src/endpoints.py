@@ -789,7 +789,7 @@ async def get_embed_playback(
             id
             idMal
             format
-            title { romaji english }
+            title { romaji english native }
             startDate { year }
         }
     }
@@ -800,8 +800,20 @@ async def get_embed_playback(
         raise HTTPException(status_code=404, detail="anime not found")
 
     title_data = media.get("title") or {}
-    titles = [v for v in (title_data.get("english"), title_data.get("romaji")) if v]
-    if not titles:
+    titles = []
+    for value in (title_data.get("english"), title_data.get("romaji"), title_data.get("native")):
+        if value and value not in titles:
+            titles.append(value)
+    # Anime databases often include the franchise name before a colon or dash.
+    # Search the distinctive subtitle too (e.g. "Steel Ball Run").
+    aliases = list(titles)
+    for value in titles:
+        for separator in (":", "：", "—", "–", " - "):
+            if separator in value:
+                tail = value.rsplit(separator, 1)[-1].strip()
+                if len(tail) >= 5 and tail not in aliases:
+                    aliases.append(tail)
+    if not aliases:
         raise HTTPException(status_code=404, detail="anime has no searchable title")
 
     def normalize(value):
@@ -813,7 +825,9 @@ async def get_embed_playback(
     kind = "movie" if is_movie else "tv"
     matches = {}
     async with httpx.AsyncClient(timeout=12.0) as client:
-        for title in titles:
+        for title in aliases:
+            # First use the known release year; only broaden the year if no safe
+            # result is found after all exact-year title searches.
             params = {"api_key": api_key, "query": title, "include_adult": "false"}
             if year:
                 params["year" if is_movie else "first_air_date_year"] = year
@@ -829,7 +843,12 @@ async def get_embed_playback(
                 original = item.get("original_title") or item.get("original_name") or ""
                 date = item.get("release_date") or item.get("first_air_date") or ""
                 item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
-                exact_title = any(normalize(candidate) in {normalize(name), normalize(original)} for candidate in titles)
+                normalized_names = (normalize(name), normalize(original))
+                exact_title = any(
+                    normalize(candidate) in normalized_names
+                    or (len(normalize(candidate)) >= 7 and any(normalize(candidate) in n for n in normalized_names))
+                    for candidate in aliases
+                )
                 exact_year = not year or item_year == year
                 if exact_title and exact_year and item.get("id"):
                     matches[item["id"]] = {
@@ -838,6 +857,39 @@ async def get_embed_playback(
                         "year": item_year,
                         "overview": item.get("overview"),
                     }
+
+    # If AniList's year is off by one (common for delayed premieres), retry
+    # only when the exact-year pass found nothing, and still require a title match.
+    if not matches and year:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            for title in aliases:
+                params = {"api_key": api_key, "query": title, "include_adult": "false"}
+                try:
+                    response = await client.get(f"https://api.themoviedb.org/3/search/{kind}", params=params)
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise HTTPException(status_code=502, detail=f"TMDB search failed with status {exc.response.status_code}")
+                except httpx.HTTPError:
+                    raise HTTPException(status_code=502, detail="could not reach TMDB")
+                for item in response.json().get("results", []):
+                    name = item.get("title") or item.get("name") or ""
+                    original = item.get("original_title") or item.get("original_name") or ""
+                    date = item.get("release_date") or item.get("first_air_date") or ""
+                    item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+                    normalized_names = (normalize(name), normalize(original))
+                    title_match = any(
+                        normalize(candidate) in normalized_names
+                        or (len(normalize(candidate)) >= 7 and any(normalize(candidate) in n for n in normalized_names))
+                        for candidate in aliases
+                    )
+                    year_close = item_year is not None and abs(item_year - year) <= 1
+                    if title_match and year_close and item.get("id"):
+                        matches[item["id"]] = {
+                            "tmdbId": item["id"],
+                            "title": name,
+                            "year": item_year,
+                            "overview": item.get("overview"),
+                        }
 
     if len(matches) != 1:
         raise HTTPException(
