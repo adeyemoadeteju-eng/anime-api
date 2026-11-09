@@ -2,6 +2,11 @@ from fastapi import APIRouter, Query, HTTPException
 from typing import Optional
 import httpx
 import base64
+import asyncio
+import time
+
+_TMDB_CANDIDATE_CACHE = {}
+_TMDB_CANDIDATE_CACHE_TTL = 300
 
 from src.queries import MEDIA_LIST_FIELDS, MEDIA_FULL_FIELDS
 from src.parser import proxy_deep_images, inject_source_slugs, encode_pipe_request, decode_pipe_response
@@ -770,17 +775,35 @@ def _tmdb_score(item, aliases, year):
 
 
 async def _tmdb_candidates(client, api_key, kind, aliases, year):
-    candidates = {}
-    for title in aliases:
+    cache_key = (kind, tuple(_tmdb_normalize(value) for value in aliases), year)
+    cached = _TMDB_CANDIDATE_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return [dict(item) for item in cached[1]]
+
+    async def search_title(title):
         params = {"api_key": api_key, "query": title, "include_adult": "false"}
         try:
-            response = await client.get(f"https://api.themoviedb.org/3/search/{kind}", params=params)
+            response = await client.get(
+                f"https://api.themoviedb.org/3/search/{kind}",
+                params=params,
+            )
             response.raise_for_status()
+            return response.json().get("results", [])
         except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=502, detail=f"TMDB search failed with status {exc.response.status_code}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"TMDB search failed with status {exc.response.status_code}",
+            )
         except httpx.HTTPError:
             raise HTTPException(status_code=502, detail="could not reach TMDB")
-        for item in response.json().get("results", []):
+
+    # Search all title aliases together. Serial requests multiplied the API
+    # timeout by the number of aliases and could exceed the browser's deadline.
+    result_sets = await asyncio.gather(*(search_title(title) for title in aliases))
+    candidates = {}
+    for results in result_sets:
+        for item in results:
             tmdb_id = item.get("id")
             if not tmdb_id:
                 continue
@@ -801,7 +824,13 @@ async def _tmdb_candidates(client, api_key, kind, aliases, year):
             }
             if not existing or candidate["score"] > existing["score"]:
                 candidates[tmdb_id] = candidate
-    return sorted(candidates.values(), key=lambda item: item["score"], reverse=True)
+
+    ranked = sorted(candidates.values(), key=lambda item: item["score"], reverse=True)
+    _TMDB_CANDIDATE_CACHE[cache_key] = (
+        time.monotonic() + _TMDB_CANDIDATE_CACHE_TTL,
+        [dict(item) for item in ranked],
+    )
+    return ranked
 
 
 def _load_tmdb_overrides():
@@ -1110,12 +1139,16 @@ async def get_embed_playback(
                 ]
                 season_matches = []
                 async with httpx.AsyncClient(timeout=15.0) as client:
-                    for candidate in contained_matches[:8]:
-                        matched_season = await _tmdb_resolve_season(
-                            client, api_key, candidate, title_data
-                        )
-                        if matched_season:
-                            season_matches.append((candidate, matched_season))
+                    season_candidates = contained_matches[:8]
+                    resolved_seasons = await asyncio.gather(*(
+                        _tmdb_resolve_season(client, api_key, candidate, title_data)
+                        for candidate in season_candidates
+                    ))
+                    season_matches = [
+                        (candidate, matched_season)
+                        for candidate, matched_season in zip(season_candidates, resolved_seasons)
+                        if matched_season
+                    ]
 
                 season_matches.sort(
                     key=lambda pair: pair[1]["score"],
