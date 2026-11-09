@@ -681,3 +681,89 @@ async def extract_simple(
             detail=f"no dub streams found for episode {episode}; try type=sub",
         )
     raise HTTPException(status_code=500, detail=f"all providers failed. last error: {last_error}")
+
+
+@router.get("/tmdb-match/{anilist_id}")
+async def get_tmdb_matches(anilist_id: int):
+    """Find possible TMDB records for an AniList anime without guessing a match."""
+    import os
+
+    api_key = os.getenv("TMDB_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
+
+    gql = """
+    query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            idMal
+            format
+            title { romaji english native }
+            startDate { year }
+        }
+    }
+    """
+    data = await anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="anime not found")
+
+    title_data = media.get("title") or {}
+    titles = []
+    for value in (title_data.get("english"), title_data.get("romaji")):
+        if value and value not in titles:
+            titles.append(value)
+    if not titles:
+        raise HTTPException(status_code=404, detail="anime has no searchable title")
+
+    media_format = media.get("format")
+    endpoint = "movie" if media_format == "MOVIE" else "tv"
+    year = (media.get("startDate") or {}).get("year")
+    matches = []
+    seen_ids = set()
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for title in titles:
+            params = {"api_key": api_key, "query": title, "include_adult": "false"}
+            if year:
+                params["year" if endpoint == "movie" else "first_air_date_year"] = year
+            try:
+                response = await client.get(
+                    f"https://api.themoviedb.org/3/search/{endpoint}",
+                    params=params,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except httpx.HTTPStatusError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"TMDB search failed with status {exc.response.status_code}",
+                )
+            except httpx.HTTPError:
+                raise HTTPException(status_code=502, detail="could not reach TMDB")
+
+            for item in payload.get("results", []):
+                tmdb_id = item.get("id")
+                if not tmdb_id or tmdb_id in seen_ids:
+                    continue
+                seen_ids.add(tmdb_id)
+                matches.append({
+                    "tmdbId": tmdb_id,
+                    "title": item.get("title") or item.get("name"),
+                    "originalTitle": item.get("original_title") or item.get("original_name"),
+                    "releaseDate": item.get("release_date") or item.get("first_air_date"),
+                    "overview": item.get("overview"),
+                    "posterPath": item.get("poster_path"),
+                    "mediaType": endpoint,
+                })
+
+    return {
+        "anilistId": media["id"],
+        "malId": media.get("idMal"),
+        "anilistTitle": title_data,
+        "format": media_format,
+        "year": year,
+        "matches": matches[:10],
+        "requiresSelection": len(matches) > 0,
+        "note": "Choose the matching TMDB record; results are candidates, not a guaranteed ID match.",
+    }
