@@ -9,8 +9,13 @@ RANKING = [
     "kaa", "anibd", "animegg", "mkissa", "animeonsen",
 ]
 
-WATCH_TIMEOUT = 75.0
-EPISODES_TIMEOUT = 60.0
+WATCH_TIMEOUT = 40.0
+PREFERRED_WATCH_TIMEOUT = 12.0
+WATCH_TOTAL_TIMEOUT = 35.0
+WATCH_MERGE_GRACE = 1.5
+EPISODES_TIMEOUT = 30.0
+EPISODES_TOTAL_TIMEOUT = 25.0
+EPISODES_MERGE_GRACE = 1.5
 WATCH_CACHE_TTL = 45.0
 
 _latency: dict = {}
@@ -72,7 +77,7 @@ async def _watch_one(mod, name, anilist_id, ep, audio, ctx):
             _watch_cache[key] = (time.time() + WATCH_CACHE_TTL, streams)
             return name, streams, dt, True
         return name, None, dt, False
-    except Exception as e:
+    except Exception:
         return name, None, round(time.time() - t0, 3), False
 
 
@@ -81,51 +86,76 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
     mods = providers()
     if not mods:
         return None
+
     ctx = await build_ctx(anilist_id)
+    timings: dict = {}
+
+    # A manually selected provider gets a short head start, not a 75-second lock.
     if preferred:
         pick = next((m for m in mods if m[0] == preferred), None)
         if pick is not None:
-            name, streams, dt, ok = await _watch_one(pick[1], pick[0], anilist_id, ep, audio, ctx)
-            record_latency(name, dt, ok)
-            if ok:
-                return {"provider": name, "streams": streams,
-                        "requestedProvider": preferred,
-                        "timings": {name: {"seconds": dt, "ok": True}},
-                        "defaultProvider": default_provider()}
+            name, mod = pick
+            started = time.monotonic()
+            try:
+                result = await asyncio.wait_for(
+                    _watch_one(mod, name, anilist_id, ep, audio, ctx),
+                    timeout=PREFERRED_WATCH_TIMEOUT,
+                )
+                _, streams, dt, ok = result
+                record_latency(name, dt, ok)
+                timings[name] = {"seconds": dt, "ok": ok}
+                if ok:
+                    return {
+                        "provider": name, "streams": streams,
+                        "requestedProvider": preferred, "timings": timings,
+                        "defaultProvider": default_provider(),
+                    }
+            except asyncio.TimeoutError:
+                dt = round(time.monotonic() - started, 3)
+                record_latency(name, dt, False)
+                timings[name] = {"seconds": dt, "ok": False, "timeout": True}
             mods = [m for m in mods if m[0] != preferred]
-            if not mods:
-                return None
-    pending = {asyncio.ensure_future(_watch_one(mod, name, anilist_id, ep, audio, ctx))
-               for name, mod in mods}
-    timings: dict = {}
+
+    if not mods:
+        return None
+
+    pending = {
+        asyncio.create_task(_watch_one(mod, name, anilist_id, ep, audio, ctx))
+        for name, mod in mods
+    }
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WATCH_TOTAL_TIMEOUT
+    merge_deadline = None
     winner = None
+
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                name, streams, dt, ok = task.result()
-                timings[name] = {"seconds": dt, "ok": ok}
-                record_latency(name, dt, ok)
-                if ok and winner is None:
-                    winner = {"provider": name, "streams": streams}
-            if winner is not None:
+            active_deadline = merge_deadline if merge_deadline is not None else deadline
+            remaining = active_deadline - loop.time()
+            if remaining <= 0:
                 break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for task in done:
+                try:
+                    name, streams, dt, ok = task.result()
+                    timings[name] = {"seconds": dt, "ok": ok}
+                    record_latency(name, dt, ok)
+                    if ok and winner is None:
+                        winner = {"provider": name, "streams": streams}
+                except Exception as e:
+                    print(f"[RACE] watch task failed: {str(e)[:120]}")
+            if winner is not None and merge_deadline is None:
+                merge_deadline = loop.time() + WATCH_MERGE_GRACE
     finally:
-
+        for task in pending:
+            task.cancel()
         if pending:
-            try:
-                done2, pending2 = await asyncio.wait(pending, timeout=8.0)
-                for task in done2:
-                    try:
-                        name, streams, dt, ok = task.result()
-                        timings[name] = {"seconds": dt, "ok": ok}
-                        record_latency(name, dt, ok)
-                    except Exception:
-                        pass
-                pending = pending2
-            finally:
-                for task in pending:
-                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
     if winner is None:
         return None
     winner["timings"] = timings
@@ -153,10 +183,43 @@ async def merged_episodes(anilist_id: int) -> dict | None:
     mods = providers()
     if not mods:
         return None
+
     ctx = await build_ctx(anilist_id)
-    results = await asyncio.gather(
-        *[_episodes_one(mod, name, anilist_id, ctx) for name, mod in mods])
-    merged = {name: data for name, data in results if data}
+    pending = {
+        asyncio.create_task(_episodes_one(mod, name, anilist_id, ctx))
+        for name, mod in mods
+    }
+    merged: dict = {}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + EPISODES_TOTAL_TIMEOUT
+    merge_deadline = None
+
+    try:
+        while pending:
+            active_deadline = merge_deadline if merge_deadline is not None else deadline
+            remaining = active_deadline - loop.time()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for task in done:
+                try:
+                    name, data = task.result()
+                    if data:
+                        merged[name] = data
+                except Exception as e:
+                    print(f"[RACE] episode task failed: {str(e)[:120]}")
+            if merged and merge_deadline is None:
+                merge_deadline = loop.time() + EPISODES_MERGE_GRACE
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     if not merged:
         return None
     return {"anilistId": anilist_id, "source": "native", "providers": merged}

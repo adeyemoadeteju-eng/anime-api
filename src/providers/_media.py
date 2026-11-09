@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 
 from src.extractor import anilist_query
@@ -20,7 +21,7 @@ _STATUS = {"RELEASING": "RELEASING", "FINISHED": "FINISHED",
 
 async def _fetch_arm(anilist_id: int):
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             res = await client.get(
                 f"{ARM}?source=anilist&id={anilist_id}",
                 headers={"User-Agent": UA, "Accept": "application/json"},
@@ -37,15 +38,10 @@ async def get_media(anilist_id: int) -> dict:
     hit = _cache.cached(key, _cache.MAPPING_TTL)
     if hit is not None:
         return hit
-    arm, data = None, None
-    try:
-        import asyncio
-        arm, data = await asyncio.gather(
-            _fetch_arm(anilist_id),
-            anilist_query(MEDIA_QUERY, {"id": int(anilist_id)}),
-        )
-    except Exception as e:
-        raise RuntimeError(f"No data found for AniList ID {anilist_id}: {e}")
+    arm, data = await asyncio.gather(
+        _fetch_arm(anilist_id),
+        anilist_query(MEDIA_QUERY, {"id": int(anilist_id)}),
+    )
     al = (data or {}).get("Media")
     if not al:
         raise RuntimeError(f"No data found for AniList ID {anilist_id}")
@@ -73,7 +69,7 @@ async def get_media(anilist_id: int) -> dict:
 
 async def get_anizip(anilist_id: int):
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(timeout=4.0) as client:
             res = await client.get(
                 f"{ANIZIP}?anilist_id={anilist_id}",
                 headers={"User-Agent": UA, "Accept": "application/json"},
@@ -86,9 +82,8 @@ async def get_anizip(anilist_id: int):
 
 
 async def build_ctx(anilist_id: int, media: dict | None = None) -> dict:
-    media = media or await get_media(anilist_id)
-    try:
-        anizip = await get_anizip(anilist_id)
-    except Exception:
-        anizip = None
-    return {"media": media, "anizip": anizip}
+    # AniZip is optional metadata; fetch it alongside the essential AniList data
+    # so an unavailable mapping service does not add another full timeout.
+    media_task = get_media(anilist_id) if media is None else asyncio.sleep(0, result=media)
+    media_result, anizip = await asyncio.gather(media_task, get_anizip(anilist_id))
+    return {"media": media_result, "anizip": anizip}
