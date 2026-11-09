@@ -861,7 +861,8 @@ async def get_embed_playback(
     else:
         embeds = [
             {"name": "VidSrc", "url": f"https://vidsrc.mov/embed/tv/{tmdb_id}/1/{episode}"},
-            {"name": "VidCore", "url": f"https://vidcore.org/embed/series/{tmdb_id}/1/{episode}"},
+            {"name": "VidCore", "url": f"https://vidcore.org/embed/tv/{tmdb_id}/1/{episode}"},
+            {"name": "VidCore (series route fallback)", "url": f"https://vidcore.org/embed/series/{tmdb_id}/1/{episode}"},
             {"name": "2Embed", "url": f"https://www.2embed.cc/embedtv/{tmdb_id}&s=1&e={episode}"},
             {"name": "VidLink", "url": f"https://vidlink.pro/tv/{tmdb_id}/1/{episode}"},
         ]
