@@ -745,13 +745,16 @@ def _tmdb_score(item, aliases, year):
                 best = max(best, 1.0)
                 continue
 
-            # The AniList title may contain the parent TMDB title, as with
-            # franchise/arc entries. Treat that as a strong title match.
+            # AniList sequel/arc titles may contain their parent TMDB series
+            # title (for example, "Steel Ball Run JoJo's Bizarre Adventure").
+            # Only accept containment in this direction: the TMDB title must be
+            # the shorter parent inside the full AniList title. The reverse
+            # direction incorrectly treats a spin-off title such as
+            # "My Hero Academia: Vigilantes" as the main "My Hero Academia"
+            # series when the exact main-series result is missing from search.
             shorter = min(len(normalized_alias), len(normalized_name))
             longer = max(len(normalized_alias), len(normalized_name))
-            if shorter >= 7 and (
-                normalized_alias in normalized_name or normalized_name in normalized_alias
-            ):
+            if shorter >= 7 and normalized_name in normalized_alias:
                 contained_title = True
                 best = max(best, 0.94 + (0.04 * shorter / longer))
                 continue
