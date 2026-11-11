@@ -9,7 +9,7 @@ from src.endpoints import (
 
 
 MHA_CANDIDATE = {
-    "tmdbId": 65930,
+    "tmdbId": "mock-mha-series",
     "title": "My Hero Academia",
     "originalTitle": "My Hero Academia",
 }
