@@ -3,6 +3,7 @@ MEDIA_LIST_FIELDS = """
     title { romaji english native }
     coverImage { large extraLarge }
     bannerImage
+    trailer { id site thumbnail }
     format
     season
     seasonYear
