@@ -3,6 +3,8 @@ name: Live MHA season mapping smoke test
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -70,3 +72,69 @@ jobs:
           for anilist_id, season in cases:
               check_mapping(anilist_id, season)
           PY
+
+  verify-live-catalogue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke test live catalogue, genre, search, and detail routes
+        env:
+          API_BASE: https://anime-api-jqpp.onrender.com
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          base = os.environ["API_BASE"].rstrip("/")
+
+          def get_json(path):
+              request = urllib.request.Request(
+                  base + path,
+                  headers={"Accept": "application/json", "User-Agent": "KuhiCatalogueSmoke/1.0"},
+              )
+              last_error = "no response"
+              for attempt in range(12):
+                  try:
+                      with urllib.request.urlopen(request, timeout=25) as response:
+                          payload = json.loads(response.read().decode("utf-8"))
+                      if not isinstance(payload, dict):
+                          raise AssertionError(f"{path}: expected JSON object")
+                      return payload
+                  except (urllib.error.HTTPError, urllib.error.URLError,
+                          TimeoutError, json.JSONDecodeError) as exc:
+                      last_error = repr(exc)
+                      if attempt < 11:
+                          time.sleep(5)
+              raise SystemExit(f"FAIL {path}: {last_error}")
+
+          def check_results(path, expected_field="results"):
+              payload = get_json(path)
+              results = payload.get(expected_field)
+              if not isinstance(results, list) or not results:
+                  raise SystemExit(f"FAIL {path}: {expected_field} is empty or missing")
+              first = results[0]
+              if not isinstance(first, dict) or not first.get("id") or not first.get("title"):
+                  raise SystemExit(f"FAIL {path}: first result is missing id/title")
+              print(f"PASS {path}: {len(results)} results; first title={first['title'].get('english') or first['title'].get('romaji')}")
+              return results
+
+          check_results("/anime/trending?page=1&per_page=5")
+          check_results("/anime/popular?page=1&per_page=5")
+
+          genres = get_json("/anime/genres").get("genres")
+          if not isinstance(genres, list) or "Action" not in genres:
+              raise SystemExit("FAIL /anime/genres: Action genre missing")
+          print(f"PASS /anime/genres: {len(genres)} genres")
+
+          check_results("/anime/filter?genre=Action&page=1&per_page=5")
+          check_results("/anime/search?query=Naruto&page=1&per_page=5")
+
+          detail = get_json("/anime/info/20")
+          if detail.get("id") != 20 or not detail.get("title") or not detail.get("coverImage"):
+              raise SystemExit("FAIL /anime/info/20: Naruto detail payload is incomplete")
+          print("PASS /anime/info/20: title and poster metadata present")
+          PY
+
