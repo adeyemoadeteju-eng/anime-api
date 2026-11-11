@@ -744,7 +744,8 @@ def _tmdb_title_aliases(title_data):
             # The romanized/native AniList title may carry only the trailing
             # season digit while the English title supplies the explicit label.
             cleaned = re.sub(r"\s*\d+$", "", cleaned).strip()
-            if len(_tmdb_normalize(cleaned)) >= 5 and cleaned not in aliases:
+            normalized_cleaned = _tmdb_normalize(cleaned)
+            if (len(normalized_cleaned) >= 5 or (not normalized_cleaned and len(cleaned) >= 5)) and cleaned not in aliases:
                 aliases.append(cleaned)
 
     for value in titles:
