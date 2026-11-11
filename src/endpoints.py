@@ -770,6 +770,40 @@ def _tmdb_score(item, aliases, year):
     original = item.get("original_title") or item.get("original_name") or ""
     names = [_tmdb_normalize(name), _tmdb_normalize(original)]
 
+    # Keep the main My Hero Academia series and its Vigilantes spin-off as
+    # separate identities. Similarity/containment alone must never let one
+    # title stand in for the other in either direction.
+    normalized_aliases = [_tmdb_normalize(alias) for alias in aliases]
+    is_mha_target = any(
+        "myheroacademia" in alias or "bokunoheroacademia" in alias
+        for alias in normalized_aliases
+    )
+    target_is_vigilantes = any(
+        ("myheroacademia" in alias or "bokunoheroacademia" in alias)
+        and "vigilantes" in alias
+        for alias in normalized_aliases
+    )
+    is_mha_candidate = any(
+        "myheroacademia" in candidate_name or "bokunoheroacademia" in candidate_name
+        for candidate_name in names
+    )
+    candidate_is_vigilantes = any(
+        ("myheroacademia" in candidate_name or "bokunoheroacademia" in candidate_name)
+        and "vigilantes" in candidate_name
+        for candidate_name in names
+    )
+
+    date = item.get("release_date") or item.get("first_air_date") or ""
+    item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+    year_delta = abs(item_year - year) if year and item_year else None
+
+    if (
+        is_mha_target
+        and is_mha_candidate
+        and target_is_vigilantes != candidate_is_vigilantes
+    ):
+        return 0.0, item_year, False, False, year_delta, "identity-conflict"
+
     best = 0.0
     exact_title = False
     contained_title = False
@@ -803,10 +837,6 @@ def _tmdb_score(item, aliases, year):
                 continue
 
             best = max(best, SequenceMatcher(None, normalized_alias, normalized_name).ratio())
-
-    date = item.get("release_date") or item.get("first_air_date") or ""
-    item_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
-    year_delta = abs(item_year - year) if year and item_year else None
 
     # Premiere year is only a tie-breaker. It must not cancel an exact or
     # strong contained title match when AniList dates a sequel/arc separately.
