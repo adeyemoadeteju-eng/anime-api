@@ -899,7 +899,8 @@ def _tmdb_season_hints(title_data, candidate):
                     if len(remainder) >= 5:
                         hints.add(remainder)
 
-        # Support common numbered season/part labels.
+        # Support common numbered season/part labels, including both
+        # "Season 2" and "2nd Season" title styles.
         for match in re.finditer(
             r"(?i)\b(?:season|part|cour|stage)\s*(\d+)|\b(\d+)(?:st|nd|rd|th)\s+(?:season|part|cour|stage)\b",
             raw_title,
@@ -907,6 +908,21 @@ def _tmdb_season_hints(title_data, candidate):
             number = match.group(1) or match.group(2)
             hints.add("season" + number)
             hints.add("part" + number)
+
+        # My Hero Academia's eighth entry is commonly titled "Final Season"
+        # rather than "8th Season". TMDB may list it simply as "Season 8",
+        # so add that equivalent hint only for the MHA franchise. Do not apply
+        # it to the separate Vigilantes spin-off.
+        is_mha_title = (
+            "myheroacademia" in normalized_title
+            or "bokunoheroacademia" in normalized_title
+        )
+        is_vigilantes = "vigilantes" in normalized_title
+        if is_mha_title and not is_vigilantes and re.search(
+            r"(?i)\bfinal\s+season\b", raw_title
+        ):
+            hints.add("season8")
+            hints.add("finalseason")
 
     return sorted(hints, key=len, reverse=True)
 
