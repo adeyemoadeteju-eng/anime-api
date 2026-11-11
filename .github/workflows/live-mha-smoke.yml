@@ -1,0 +1,72 @@
+name: Live MHA season mapping smoke test
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-mha-mappings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify live Season 1 and Season 2 mappings
+        env:
+          API_BASE: https://anime-api-jqpp.onrender.com
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          API_BASE = os.environ['API_BASE']
+          expected_tmdb_id = 65930
+          cases = [(21459, 1), (21856, 2)]
+
+          def check_mapping(anilist_id, expected_season):
+              url = f"{API_BASE}/anime/playback/{anilist_id}?episode=1"
+              last_result = "no response"
+              for attempt in range(36):
+                  try:
+                      with urllib.request.urlopen(url, timeout=12) as response:
+                          payload = json.loads(response.read().decode("utf-8"))
+                      tmdb_id = payload.get("tmdbId")
+                      season = payload.get("season")
+                      title = payload.get("tmdbTitle") or ""
+                      is_correct = (
+                          tmdb_id == expected_tmdb_id
+                          and season == expected_season
+                          and "vigilantes" not in title.lower()
+                      )
+                      if is_correct:
+                          print(
+                              f"PASS AniList {anilist_id}: "
+                              f"TMDB {tmdb_id} ({title or 'verified mapping'}), "
+                              f"season {season}"
+                          )
+                          return
+                      last_result = (
+                          f"unexpected mapping: tmdbId={tmdb_id}, "
+                          f"tmdbTitle={title!r}, season={season}"
+                      )
+                  except urllib.error.HTTPError as exc:
+                      body = exc.read().decode("utf-8", "replace")
+                      last_result = f"HTTP {exc.code}: {body[:500]}"
+                  except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      last_result = repr(exc)
+
+                  # Render may still be deploying the new main commit.
+                  if attempt < 35:
+                      time.sleep(5)
+
+              raise SystemExit(
+                  f"FAIL AniList {anilist_id}: expected TMDB "
+                  f"{expected_tmdb_id}, season {expected_season}; {last_result}"
+              )
+
+          for anilist_id, season in cases:
+              check_mapping(anilist_id, season)
+          PY

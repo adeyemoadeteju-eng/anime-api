@@ -697,14 +697,57 @@ def _tmdb_normalize(value):
     return re.sub(r"[^a-z0-9]+", "", value)
 
 
+def _tmdb_has_explicit_season_marker(title_data):
+    """Whether any AniList title explicitly identifies a season/part number."""
+    import re
+
+    season_suffix = re.compile(
+        r"(?i)(?:\s+(?:season|part|cour|stage)\s*(?:\d+|final)"
+        r"|\s+\d+(?:st|nd|rd|th)\s+(?:season|part|cour|stage)"
+        r"|\s+final\s+season)\s*$"
+    )
+    return any(
+        isinstance(value, str) and season_suffix.search(value.strip())
+        for value in (
+            title_data.get("english"),
+            title_data.get("romaji"),
+            title_data.get("native"),
+        )
+    )
+
+
 def _tmdb_title_aliases(title_data):
     import re
+
     titles = []
     for value in (title_data.get("english"), title_data.get("romaji"), title_data.get("native")):
         if value and value not in titles:
             titles.append(value)
 
     aliases = list(titles)
+
+    # AniList often stores sequel seasons as "My Hero Academia Season 2",
+    # "Boku no Hero Academia 2", or a native title ending in a digit. Search
+    # TMDB with the clean parent title too, then resolve the requested season
+    # against the parent's actual TMDB season list.
+    season_suffix = re.compile(
+        r"(?i)(?:\s+(?:season|part|cour|stage)\s*(?:\d+|final)"
+        r"|\s+\d+(?:st|nd|rd|th)\s+(?:season|part|cour|stage)"
+        r"|\s+final\s+season)\s*$"
+    )
+    has_explicit_season = any(
+        season_suffix.search(value.strip()) for value in titles if isinstance(value, str)
+    )
+    if has_explicit_season:
+        for value in titles:
+            cleaned = season_suffix.sub("", value.strip()).strip()
+            # The romanized/native AniList title may carry only the trailing
+            # season digit while the English title supplies the explicit label.
+            cleaned = re.sub(r"\s*\d+$", "", cleaned).strip()
+            normalized_cleaned = _tmdb_normalize(cleaned)
+            if (len(normalized_cleaned) >= 5 or (not normalized_cleaned and len(cleaned) >= 5)) and cleaned not in aliases:
+                aliases.append(cleaned)
+
     for value in titles:
         # Subtitle separators can produce useful alternate search names.
         # Avoid splitting on a plain spaced hyphen: anime titles often use it
@@ -999,6 +1042,19 @@ async def _tmdb_resolve_season(client, api_key, candidate, title_data):
     return ranked[0]
 
 
+async def _tmdb_exact_match_mapping(client, api_key, candidate, title_data):
+    """Exact parent title plus verified requested season, or no match."""
+    if _tmdb_has_explicit_season_marker(title_data):
+        resolved = await _tmdb_resolve_season(
+            client, api_key, candidate, title_data
+        )
+        if not resolved:
+            return None
+        return candidate.get("tmdbId"), resolved["seasonNumber"]
+
+    return candidate.get("tmdbId"), 1
+
+
 @router.get("/tmdb-match/{anilist_id}")
 async def get_tmdb_matches(anilist_id: int):
     """Diagnostic search: returns ranked TMDB candidates and their available seasons."""
@@ -1135,9 +1191,9 @@ async def get_embed_playback(
         # the correct named TMDB season (e.g. Steel Ball Run on the JoJo show).
         if candidates:
             exact_matches = [item for item in candidates if item.get("exactTitle")]
+            selected_exact = None
             if len(exact_matches) == 1:
-                tmdb_id = exact_matches[0]["tmdbId"]
-                season = 1
+                selected_exact = exact_matches[0]
             elif len(exact_matches) > 1:
                 ranked_exact = sorted(
                     exact_matches,
@@ -1146,8 +1202,22 @@ async def get_embed_playback(
                 first_delta = ranked_exact[0].get("yearDelta")
                 second_delta = ranked_exact[1].get("yearDelta")
                 if first_delta is not None and (second_delta is None or second_delta - first_delta >= 2):
-                    tmdb_id = ranked_exact[0]["tmdbId"]
-                    season = 1
+                    selected_exact = ranked_exact[0]
+
+            if selected_exact:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    exact_mapping = await _tmdb_exact_match_mapping(
+                        client, api_key, selected_exact, title_data
+                    )
+                if exact_mapping:
+                    tmdb_id, season = exact_mapping
+                elif _tmdb_has_explicit_season_marker(title_data):
+                    # Do not let a season-specific AniList entry fall through
+                    # to fuzzy matching and accidentally become Season 1.
+                    candidates = [
+                        item for item in candidates
+                        if item.get("tmdbId") != selected_exact.get("tmdbId")
+                    ]
 
             # For sequel/arc entries, test the candidate's actual TMDB season
             # names. Never silently fall back to Season 1 of its parent show.
@@ -1227,6 +1297,15 @@ async def get_embed_playback(
             },
         )
 
+    selected_candidate = next(
+        (item for item in candidates if item.get("tmdbId") == tmdb_id),
+        None,
+    )
+    tmdb_title = (
+        selected_candidate.get("title") or selected_candidate.get("originalTitle")
+        if selected_candidate else None
+    )
+
     mapped_episode = 1 if is_movie else episode + episode_offset
     if is_movie:
         embeds = [
@@ -1248,6 +1327,7 @@ async def get_embed_playback(
         "anilistId": anilist_id,
         "malId": media.get("idMal"),
         "tmdbId": tmdb_id,
+        "tmdbTitle": tmdb_title,
         "season": season,
         "episode": mapped_episode,
         "mediaType": kind,
