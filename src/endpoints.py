@@ -8,7 +8,7 @@ import time
 _TMDB_CANDIDATE_CACHE = {}
 _TMDB_CANDIDATE_CACHE_TTL = 300
 
-from src.queries import MEDIA_LIST_FIELDS, MEDIA_FULL_FIELDS
+from src.queries import MEDIA_HOME_FIELDS, MEDIA_LIST_FIELDS, MEDIA_FULL_FIELDS
 from src.parser import proxy_deep_images, inject_source_slugs, encode_pipe_request, decode_pipe_response
 from src.extractor import anilist_query, fetch_raw_episodes
 from src.config import iter_miruro_pipe_targets
@@ -168,14 +168,14 @@ async def filter_anime(
     return proxy_deep_images(response)
 
 
-async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, per_page: int = 20):
+async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, per_page: int = 20, fields: str = MEDIA_LIST_FIELDS):
     status_filter = f", status: {status}" if status else ""
     gql = f"""
     query ($page: Int, $perPage: Int) {{
         Page(page: $page, perPage: $perPage) {{
             pageInfo {{ total currentPage lastPage hasNextPage perPage }}
             media(type: ANIME, sort: [{sort_type}]{status_filter}) {{
-                {MEDIA_LIST_FIELDS}
+                {fields}
             }}
         }}
     }}
@@ -194,6 +194,29 @@ async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, p
     return proxy_deep_images(response)
 
 
+
+
+
+@router.get("/home")
+async def get_home():
+    """Compact homepage payload; fetch both catalogue rails concurrently."""
+    popular_result, recent_result = await asyncio.gather(
+        _fetch_collection("POPULARITY_DESC", page=1, per_page=12, fields=MEDIA_HOME_FIELDS),
+        _fetch_collection("START_DATE_DESC", "RELEASING", page=1, per_page=12, fields=MEDIA_HOME_FIELDS),
+        return_exceptions=True,
+    )
+
+    popular_failed = isinstance(popular_result, Exception)
+    recent_failed = isinstance(recent_result, Exception)
+    if popular_failed and recent_failed:
+        raise HTTPException(status_code=502, detail="catalogue is temporarily unavailable")
+
+    return {
+        "popular": [] if popular_failed else popular_result.get("results", []),
+        "recent": [] if recent_failed else recent_result.get("results", []),
+        "partial": popular_failed or recent_failed,
+    }
+
 @router.get("/spotlight")
 async def get_spotlight():
 
@@ -201,7 +224,7 @@ async def get_spotlight():
     query {{
         Page(page: 1, perPage: 10) {{
             media(sort: [TRENDING_DESC, POPULARITY_DESC], type: ANIME) {{
-                {MEDIA_LIST_FIELDS}
+                {MEDIA_HOME_FIELDS}
             }}
         }}
     }}
