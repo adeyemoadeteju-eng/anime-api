@@ -97,8 +97,8 @@ def _shape_watch_providers(country_data: dict | None) -> list[dict]:
                     "id": int(provider_id),
                     "name": name,
                     "logoUrl": (
-                        "https://image.tmdb.org/t/p/w92" + item["logo_path"]
-                        if item.get("logo_path", "").startswith("/")
+                        "https://image.tmdb.org/t/p/w92" + (item.get("logo_path") or "")
+                        if (item.get("logo_path") or "").startswith("/")
                         else None
                     ),
                     "displayPriority": item.get("display_priority", 999),
