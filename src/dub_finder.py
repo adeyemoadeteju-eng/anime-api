@@ -17,7 +17,7 @@ router = APIRouter()
 
 
 def _normalize_region(region: str) -> str:
-    normalized = (region or "CA").strip().upper()
+    normalized = ("CA" if region is None else region).strip().upper()
     if not re.fullmatch(r"[A-Z]{2}", normalized):
         raise HTTPException(
             status_code=400,
