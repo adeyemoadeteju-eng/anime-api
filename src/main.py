@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from src.endpoints import router
+from src.dub_finder import router as dub_finder_router
 from src.extractor import close_http_client
 from src.config import HEADERS
 import httpx
@@ -22,6 +23,7 @@ if os.path.exists("assets"):
     app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
 app.include_router(router, prefix="/anime")
+app.include_router(dub_finder_router, prefix="/anime")
 
 
 @app.middleware("http")
