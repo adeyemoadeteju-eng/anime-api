@@ -1,3 +1,13 @@
+MEDIA_HOME_FIELDS = """
+    id
+    title { romaji english native }
+    coverImage { large extraLarge }
+    trailer { id site thumbnail }
+    format
+    seasonYear
+    genres
+"""
+
 MEDIA_LIST_FIELDS = """
     id
     title { romaji english native }

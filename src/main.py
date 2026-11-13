@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from src.endpoints import router
+from src.extractor import close_http_client
 from src.config import HEADERS
 import httpx
 import os
@@ -21,6 +22,35 @@ if os.path.exists("assets"):
     app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
 app.include_router(router, prefix="/anime")
+
+
+@app.middleware("http")
+async def add_metadata_cache_headers(request, call_next):
+    response = await call_next(request)
+    if request.method == "GET" and response.status_code < 400:
+        path = request.url.path
+        if path == "/anime/home":
+            response.headers["Cache-Control"] = "public, max-age=120, stale-while-revalidate=300"
+        elif path.startswith("/anime/info/"):
+            response.headers["Cache-Control"] = "public, max-age=600, stale-while-revalidate=1800"
+        elif path == "/anime/genres":
+            response.headers["Cache-Control"] = "public, max-age=3600, stale-while-revalidate=7200"
+        elif path in (
+            "/anime/popular",
+            "/anime/recent",
+            "/anime/trending",
+            "/anime/upcoming",
+            "/anime/filter",
+        ):
+            response.headers["Cache-Control"] = "public, max-age=120, stale-while-revalidate=300"
+        elif path == "/anime/search":
+            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=180"
+    return response
+
+
+@app.on_event("shutdown")
+async def shutdown_shared_http_client():
+    await close_http_client()
 
 from fastapi import Query
 from fastapi.responses import Response
