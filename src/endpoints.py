@@ -1113,10 +1113,9 @@ async def _tmdb_exact_match_mapping(client, api_key, candidate, title_data):
 async def get_tmdb_matches(anilist_id: int):
     """Diagnostic search: returns ranked TMDB candidates and their available seasons."""
     import os
-    audio = (audio or "sub").lower()
-    if audio not in ("sub", "dub"):
-        raise HTTPException(status_code=422, detail="type must be sub or dub")
     api_key = os.getenv("TMDB_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
 
     gql = """
     query ($id: Int) {
@@ -1137,17 +1136,6 @@ async def get_tmdb_matches(anilist_id: int):
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="anime not found")
-
-    extra_sources = await get_extra_playback_sources(media, anilist_id, episode, audio)
-    if not api_key:
-        return {
-            "anilistId": anilist_id,
-            "malId": media.get("idMal"),
-            "mediaType": "movie" if media.get("format") == "MOVIE" else "tv",
-            "episode": 1 if media.get("format") == "MOVIE" else episode,
-            "mappingSource": "AniList",
-            "sources": extra_sources,
-        }
 
     title_data = media.get("title") or {}
     titles, aliases = _tmdb_title_aliases(title_data)
@@ -1210,9 +1198,10 @@ async def get_embed_playback(
 ):
     """Return embed candidates using verified overrides or an unambiguous ranked TMDB match."""
     import os
+    audio = (audio or "sub").lower()
+    if audio not in ("sub", "dub"):
+        raise HTTPException(status_code=422, detail="type must be sub or dub")
     api_key = os.getenv("TMDB_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
 
     gql = """
     query ($id: Int) {
@@ -1227,6 +1216,17 @@ async def get_embed_playback(
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="anime not found")
+
+    extra_sources = await get_extra_playback_sources(media, anilist_id, episode, audio)
+    if not api_key:
+        return {
+            "anilistId": anilist_id,
+            "malId": media.get("idMal"),
+            "mediaType": "movie" if media.get("format") == "MOVIE" else "tv",
+            "episode": 1 if media.get("format") == "MOVIE" else episode,
+            "mappingSource": "AniList",
+            "sources": extra_sources,
+        }
 
     title_data = media.get("title") or {}
     titles, aliases = _tmdb_title_aliases(title_data)

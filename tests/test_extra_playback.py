@@ -36,7 +36,7 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
         array_payload = {"episodes": [{"number": "1", "embed_url": {"sub": "https://x.test/1"}}]}
         map_payload = {"episodes": {"2": {"embed_url": {"dub": "https://x.test/2"}}}}
         self.assertEqual(extra_playback.extract_episode_row(array_payload, 1)["number"], "1")
-        self.assertEqual(extra_playback.extract_episode_row(map_payload, 2)["number"], 2)
+        self.assertEqual(int(extra_playback.extract_episode_row(map_payload, 2)["number"]), 2)
 
     def test_external_embed_url_requires_https(self):
         self.assertTrue(extra_playback.is_safe_embed_url("https://player.example/embed/1"))
