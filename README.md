@@ -334,6 +334,7 @@ Skipped: `2dhive` (partial library, embed-only), `anidbapp` / `animenosub` / `se
 
 - **AnimeEmbed:** `https://animeembed.com/embed/ani/{ANILIST_ID}/{EPISODE}`; uses `track=sub|dub`.
 - **AniEmbed:** `https://aniembed.se/e/{ANILIST_ID}/{EPISODE}`; uses `lang=sub|dub`.
+- **Vidy:** `https://www.vidy.st/anime/{ANILIST_ID}/{EPISODE}`; enables its episode picker and next-episode control with AniOrbit's accent. Autoplay remains off. Its supplied options do not document a Sub/Dub parameter.
 - **Aanikoto API:** the backend checks the recent-anime catalogue, matches an unambiguous title, then reads that episode's `embed_url.sub` or `embed_url.dub` from `/series/{id}`. Responses are cached server-side. For a title absent from the recent page, the optional `ANIKOTO_SERIES_MAP` environment variable may contain a JSON object mapping AniList IDs to Aanikoto series IDs.
 
 These iframe candidates are returned in the same `sources` array as the existing playback sources. The browser does not call Aanikoto directly. Its source is skipped when the API is unavailable, too slow, or the title match is ambiguous.

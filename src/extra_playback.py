@@ -15,6 +15,7 @@ import httpx
 ANIKOTO_BASE = "https://anikotoapi.site"
 ANIMEEMBED_BASE = "https://animeembed.com"
 ANIEMBED_BASE = "https://aniembed.se"
+VIDY_BASE = "https://www.vidy.st"
 RECENT_TTL = 600
 SERIES_TTL = 600
 REQUEST_TIMEOUT = 3.0
@@ -142,6 +143,16 @@ def build_aniembed_url(anilist_id: int, episode: int, audio: str) -> str:
     return f"{ANIEMBED_BASE}/e/{int(anilist_id)}/{int(episode)}?{query}"
 
 
+def build_vidy_url(anilist_id: int, episode: int) -> str:
+    """Build Vidy's documented AniList anime route; autoplay remains off."""
+    query = urlencode({
+        "color": "9b87ff",
+        "nextEpisode": "true",
+        "episodeSelector": "true",
+    })
+    return f"{VIDY_BASE}/anime/{int(anilist_id)}/{int(episode)}?{query}"
+
+
 async def _fetch_recent_rows() -> list[dict]:
     global _recent_task
     async with _recent_lock:
@@ -255,6 +266,12 @@ async def get_extra_playback_sources(media: dict, anilist_id: int, episode: int,
             "type": "embed",
             "audio": audio,
             "url": build_aniembed_url(anilist_id, embed_episode, audio),
+        },
+        {
+            "name": "Vidy",
+            "provider": "vidy",
+            "type": "embed",
+            "url": build_vidy_url(anilist_id, embed_episode),
         },
     ]
     try:

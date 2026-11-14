@@ -25,6 +25,17 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query["autoplay"], ["0"])
         self.assertEqual(query["t"], ["0"])
 
+    def test_vidy_uses_documented_anilist_route_and_leaves_autoplay_off(self):
+        url = extra_playback.build_vidy_url(151807, 3)
+        parsed = urlparse(url)
+        self.assertEqual(parsed.netloc, "www.vidy.st")
+        self.assertEqual(parsed.path, "/anime/151807/3")
+        query = parse_qs(parsed.query)
+        self.assertEqual(query["color"], ["9b87ff"])
+        self.assertEqual(query["episodeSelector"], ["true"])
+        self.assertEqual(query["nextEpisode"], ["true"])
+        self.assertNotIn("autoplay", query)
+
     def test_recent_catalogue_title_match_requires_unique_id(self):
         media = {"title": {"english": "Solo Leveling", "romaji": "Ore dake Level Up na Ken"}}
         rows = [{"id": 42, "title": "Solo Leveling"}, {"id": 43, "title": "Another show"}]
@@ -46,15 +57,17 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
     async def test_movie_embed_urls_always_use_episode_one(self):
         with patch("src.extra_playback._anikoto_source", new=AsyncMock(return_value=None)):
             sources = await extra_playback.get_extra_playback_sources({"format": "MOVIE"}, 151807, 7, "sub")
-        self.assertEqual(len(sources), 2)
+        self.assertEqual(len(sources), 3)
         self.assertIn("/151807/1", sources[0]["url"])
         self.assertIn("/151807/1", sources[1]["url"])
+        self.assertIn("/anime/151807/1", sources[2]["url"])
 
     async def test_anikoto_source_is_optional_when_catalogue_does_not_match(self):
         with patch("src.extra_playback._anikoto_source", new=AsyncMock(return_value=None)):
             sources = await extra_playback.get_extra_playback_sources({"format": "TV"}, 151807, 4, "dub")
-        self.assertEqual([source["name"] for source in sources], ["AnimeEmbed", "AniEmbed"])
-        self.assertTrue(all(source["audio"] == "dub" for source in sources))
+        self.assertEqual([source["name"] for source in sources], ["AnimeEmbed", "AniEmbed", "Vidy"])
+        self.assertTrue(all(source["audio"] == "dub" for source in sources[:2]))
+        self.assertNotIn("audio", sources[2])
 
     async def test_playback_endpoint_returns_embeds_without_tmdb_key(self):
         media = {"id": 151807, "idMal": None, "format": "TV",
