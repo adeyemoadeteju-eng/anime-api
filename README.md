@@ -328,6 +328,18 @@ All ports are pure Python (`src/providers/`, httpx only). Tested 10/09/2026 on N
 
 Skipped: `2dhive` (partial library, embed-only), `anidbapp` / `animenosub` / `senshi` / `animedunya` (no results on test titles).
 
+### Additional iframe playback sources
+
+`GET /anime/playback/{anilist_id}?episode=1&type=sub` includes these additional iframe candidates in its normal `sources` array:
+
+- **AnimeEmbed:** `https://animeembed.com/embed/ani/{ANILIST_ID}/{EPISODE}`; uses `track=sub|dub`.
+- **AniEmbed:** `https://aniembed.se/e/{ANILIST_ID}/{EPISODE}`; uses `lang=sub|dub`.
+- **Aanikoto API:** the backend checks the recent-anime catalogue, matches an unambiguous title, then reads that episode's `embed_url.sub` or `embed_url.dub` from `/series/{id}`. Responses are cached server-side. For a title absent from the recent page, the optional `ANIKOTO_SERIES_MAP` environment variable may contain a JSON object mapping AniList IDs to Aanikoto series IDs.
+
+These iframe candidates are returned in the same `sources` array as the existing playback sources. The browser does not call Aanikoto directly. Its source is skipped when the API is unavailable, too slow, or the title match is ambiguous.
+
+MoStream is not included yet: the supplied documentation shows its catalogue endpoint (`https://api.mostream.us/anime/`) but not the per-title/episode lookup response or direct embed URL structure.
+
 ### Proxy Endpoints
 
 #### `GET /proxy_m3u8`

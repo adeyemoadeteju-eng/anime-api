@@ -13,6 +13,7 @@ from src.parser import proxy_deep_images, inject_source_slugs, encode_pipe_reque
 from src.extractor import anilist_query, fetch_raw_episodes
 from src.config import iter_miruro_pipe_targets
 from src.providers import _race as provider_race
+from src.extra_playback import get_extra_playback_sources
 
 router = APIRouter()
 
@@ -1112,9 +1113,10 @@ async def _tmdb_exact_match_mapping(client, api_key, candidate, title_data):
 async def get_tmdb_matches(anilist_id: int):
     """Diagnostic search: returns ranked TMDB candidates and their available seasons."""
     import os
+    audio = (audio or "sub").lower()
+    if audio not in ("sub", "dub"):
+        raise HTTPException(status_code=422, detail="type must be sub or dub")
     api_key = os.getenv("TMDB_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="TMDB_API_KEY is not configured")
 
     gql = """
     query ($id: Int) {
@@ -1135,6 +1137,17 @@ async def get_tmdb_matches(anilist_id: int):
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="anime not found")
+
+    extra_sources = await get_extra_playback_sources(media, anilist_id, episode, audio)
+    if not api_key:
+        return {
+            "anilistId": anilist_id,
+            "malId": media.get("idMal"),
+            "mediaType": "movie" if media.get("format") == "MOVIE" else "tv",
+            "episode": 1 if media.get("format") == "MOVIE" else episode,
+            "mappingSource": "AniList",
+            "sources": extra_sources,
+        }
 
     title_data = media.get("title") or {}
     titles, aliases = _tmdb_title_aliases(title_data)
@@ -1193,6 +1206,7 @@ async def get_tmdb_matches(anilist_id: int):
 async def get_embed_playback(
     anilist_id: int,
     episode: int = Query(1, ge=1, le=1000),
+    audio: str = Query("sub", alias="type"),
 ):
     """Return embed candidates using verified overrides or an unambiguous ranked TMDB match."""
     import os
@@ -1339,16 +1353,15 @@ async def get_embed_playback(
                 for item in candidates[:5]
             ],
         )
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "TMDB could not confidently identify the correct show and season; playback was not started.",
-                "candidates": candidates[:8],
-                "anilistTitles": titles,
-                "year": year,
-                "anilistId": anilist_id,
-            },
-        )
+        return {
+            "anilistId": anilist_id,
+            "malId": media.get("idMal"),
+            "mediaType": kind,
+            "episode": 1 if is_movie else episode,
+            "mappingSource": "AniList fallback",
+            "sources": extra_sources,
+            "note": "TMDB could not confidently identify this title, so AniList-compatible embed servers are shown instead.",
+        }
 
     selected_candidate = next(
         (item for item in candidates if item.get("tmdbId") == tmdb_id),
@@ -1385,5 +1398,5 @@ async def get_embed_playback(
         "episode": mapped_episode,
         "mediaType": kind,
         "mappingSource": "verified-override" if override else "automatic",
-        "sources": embeds,
+        "sources": extra_sources + embeds,
     }
