@@ -6,6 +6,7 @@ MEDIA_HOME_FIELDS = """
     format
     seasonYear
     genres
+    isAdult
 """
 
 MEDIA_LIST_FIELDS = """
@@ -53,7 +54,7 @@ MEDIA_FULL_FIELDS = """
     favourites
     trending
     genres
-    tags { name rank isMediaSpoiler }
+    tags { name rank isMediaSpoiler isAdult }
     source
     countryOfOrigin
     isAdult
@@ -90,6 +91,8 @@ MEDIA_FULL_FIELDS = """
                 status
                 episodes
                 meanScore
+                isAdult
+                genres
             }
         }
     }
@@ -105,6 +108,8 @@ MEDIA_FULL_FIELDS = """
                 status
                 meanScore
                 averageScore
+                isAdult
+                genres
             }
         }
     }
