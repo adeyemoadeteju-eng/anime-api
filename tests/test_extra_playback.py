@@ -76,9 +76,11 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
             {"name": "AnimeEmbed", "url": "https://animeembed.com/embed/ani/151807/1?track=sub"},
             {"name": "AniEmbed", "url": "https://aniembed.se/e/151807/1?lang=sub"},
         ]
-        with patch.dict(os.environ, {"TMDB_API_KEY": ""}), \
-             patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})), \
-             patch("src.endpoints.get_extra_playback_sources", new=AsyncMock(return_value=extras)):
+        with (
+            patch.dict(os.environ, {"TMDB_API_KEY": ""}),
+            patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})),
+            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock()) as provider_lookup,
+        ):
             result = await endpoints.get_embed_playback(151807, 1, "sub")
         self.assertEqual(result["sources"], extras)
         self.assertEqual(result["mappingSource"], "AniList")
