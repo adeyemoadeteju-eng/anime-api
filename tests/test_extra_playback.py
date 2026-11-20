@@ -79,7 +79,7 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.dict(os.environ, {"TMDB_API_KEY": ""}),
             patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})),
-            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock()) as provider_lookup,
+            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock(return_value=extras)),
         ):
             result = await endpoints.get_embed_playback(151807, 1, "sub")
         self.assertEqual(result["sources"], extras)
