@@ -76,12 +76,38 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
             {"name": "AnimeEmbed", "url": "https://animeembed.com/embed/ani/151807/1?track=sub"},
             {"name": "AniEmbed", "url": "https://aniembed.se/e/151807/1?lang=sub"},
         ]
-        with patch.dict(os.environ, {"TMDB_API_KEY": ""}), \
-             patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})), \
-             patch("src.endpoints.get_extra_playback_sources", new=AsyncMock(return_value=extras)):
+        with (
+            patch.dict(os.environ, {"TMDB_API_KEY": ""}),
+            patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})),
+            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock(return_value=extras)),
+        ):
             result = await endpoints.get_embed_playback(151807, 1, "sub")
         self.assertEqual(result["sources"], extras)
         self.assertEqual(result["mappingSource"], "AniList")
+
+
+    async def test_playback_rejects_adult_media_before_provider_lookup(self):
+        media = {
+            "id": 151807, "idMal": None, "format": "TV", "isAdult": True,
+            "genres": ["Action"], "tags": [],
+            "title": {"english": "Adult Test", "romaji": "Adult Test"},
+        }
+        with (
+            patch.dict(os.environ, {"TMDB_API_KEY": ""}),
+            patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})),
+            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock()) as provider_lookup,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await endpoints.get_embed_playback(151807, 1, "sub")
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "Adult and hentai titles are excluded from AniOrbit.")
+        provider_lookup.assert_not_awaited()
+
+    def test_playback_maturity_check_catches_hentai_and_adult_tags(self):
+        self.assertTrue(endpoints._is_adult_media({"genres": ["Action", "Hentai"]}))
+        self.assertTrue(endpoints._is_adult_media({"tags": [{"name": "Adult", "isAdult": True}]}))
+        self.assertTrue(endpoints._is_adult_media({"tags": [{"name": "hentai", "isAdult": False}]}))
+        self.assertFalse(endpoints._is_adult_media({"genres": ["Action"], "tags": [{"name": "Adventure", "isAdult": False}]}))
 
     async def test_playback_rejects_unknown_audio_mode(self):
         with patch.dict(os.environ, {"TMDB_API_KEY": ""}):
