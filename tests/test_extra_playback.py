@@ -92,9 +92,11 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
             "genres": ["Action"], "tags": [],
             "title": {"english": "Adult Test", "romaji": "Adult Test"},
         }
-        with patch.dict(os.environ, {"TMDB_API_KEY": ""}), \\
-             patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})), \\
-             patch("src.endpoints.get_extra_playback_sources", new=AsyncMock()) as provider_lookup:
+        with (
+            patch.dict(os.environ, {"TMDB_API_KEY": ""}),
+            patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})),
+            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock()) as provider_lookup,
+        ):
             with self.assertRaises(HTTPException) as raised:
                 await endpoints.get_embed_playback(151807, 1, "sub")
         self.assertEqual(raised.exception.status_code, 403)
