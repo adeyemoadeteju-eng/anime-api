@@ -1190,6 +1190,23 @@ async def get_tmdb_matches(anilist_id: int):
     }
 
 
+def _is_adult_media(media: dict) -> bool:
+    """Keep direct playback behind the same maturity gate as the AniOrbit UI."""
+    if not isinstance(media, dict):
+        return False
+    if media.get("isAdult") is True:
+        return True
+    if any(str(genre or "").strip().casefold() == "hentai" for genre in (media.get("genres") or [])):
+        return True
+    for tag in media.get("tags") or []:
+        if isinstance(tag, dict) and (
+            tag.get("isAdult") is True
+            or str(tag.get("name") or "").strip().casefold() == "hentai"
+        ):
+            return True
+    return False
+
+
 @router.get("/playback/{anilist_id}")
 async def get_embed_playback(
     anilist_id: int,
@@ -1206,7 +1223,8 @@ async def get_embed_playback(
     gql = """
     query ($id: Int) {
         Media(id: $id, type: ANIME) {
-            id idMal format
+            id idMal format isAdult genres
+            tags { name isAdult }
             title { romaji english native }
             startDate { year }
         }
@@ -1216,6 +1234,8 @@ async def get_embed_playback(
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="anime not found")
+    if _is_adult_media(media):
+        raise HTTPException(status_code=403, detail="Adult and hentai titles are excluded from AniOrbit.")
 
     extra_sources = await get_extra_playback_sources(media, anilist_id, episode, audio)
     if not api_key:
