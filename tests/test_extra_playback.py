@@ -109,6 +109,37 @@ class ExtraPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(endpoints._is_adult_media({"tags": [{"name": "hentai", "isAdult": False}]}))
         self.assertFalse(endpoints._is_adult_media({"genres": ["Action"], "tags": [{"name": "Adventure", "isAdult": False}]}))
 
+    def test_firefly_wedding_is_not_misclassified_by_adult_metadata(self):
+        english_title = {
+            "title": {"english": "Firefly Wedding", "romaji": "Hotaru no Yomeiri"},
+            "isAdult": True,
+            "genres": ["Romance", "Hentai"],
+            "tags": [{"name": "Hentai", "isAdult": True}],
+        }
+        japanese_romanized_title = {
+            "title": {"romaji": "Hotaru no Yomeiri"},
+            "isAdult": True,
+            "genres": ["Drama"],
+        }
+        self.assertFalse(endpoints._is_adult_media(english_title))
+        self.assertFalse(endpoints._is_adult_media(japanese_romanized_title))
+
+    async def test_firefly_wedding_playback_is_not_blocked_by_adult_flag(self):
+        media = {
+            "id": 151807, "idMal": None, "format": "TV", "isAdult": True,
+            "genres": ["Romance", "Hentai"], "tags": [],
+            "title": {"english": "Firefly Wedding", "romaji": "Hotaru no Yomeiri"},
+        }
+        extras = [{"name": "AniEmbed", "url": "https://aniembed.se/e/151807/1?lang=sub"}]
+        with (
+            patch.dict(os.environ, {"TMDB_API_KEY": ""}),
+            patch("src.endpoints.anilist_query", new=AsyncMock(return_value={"Media": media})),
+            patch("src.endpoints.get_extra_playback_sources", new=AsyncMock(return_value=extras)) as provider_lookup,
+        ):
+            result = await endpoints.get_embed_playback(151807, 1, "sub")
+        self.assertEqual(result["sources"], extras)
+        provider_lookup.assert_awaited_once()
+
     async def test_playback_rejects_unknown_audio_mode(self):
         with patch.dict(os.environ, {"TMDB_API_KEY": ""}):
             with self.assertRaises(HTTPException) as raised:

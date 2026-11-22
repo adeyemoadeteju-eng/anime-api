@@ -1190,9 +1190,27 @@ async def get_tmdb_matches(anilist_id: int):
     }
 
 
-def _is_adult_media(media: dict) -> bool:
-    """Keep direct playback behind the same maturity gate as the AniOrbit UI."""
+def _is_firefly_wedding(media: dict) -> bool:
+    """Recognize the non-hentai Firefly Wedding anime by its known titles."""
     if not isinstance(media, dict):
+        return False
+    title = media.get("title") or {}
+    if not isinstance(title, dict):
+        return False
+    names = " ".join(
+        str(title.get(key) or "").casefold()
+        for key in ("english", "romaji", "native")
+    )
+    return "firefly wedding" in names or "hotaru no yomeiri" in names
+
+
+def _is_adult_media(media: dict) -> bool:
+    """Keep playback behind the maturity gate, with a narrow Firefly Wedding correction."""
+    if not isinstance(media, dict):
+        return False
+    # AniList's adult flag/genre metadata is incorrectly classifying this title.
+    # Keep the exception title-specific; do not relax the gate for other anime.
+    if _is_firefly_wedding(media):
         return False
     if media.get("isAdult") is True:
         return True
