@@ -26,6 +26,12 @@ app.include_router(router, prefix="/anime")
 app.include_router(dub_finder_router, prefix="/anime")
 
 
+@app.get("/healthz")
+async def healthz():
+    """Lightweight endpoint used to keep the API warm without loading the docs UI."""
+    return {"status": "ok"}
+
+
 @app.middleware("http")
 async def add_metadata_cache_headers(request, call_next):
     response = await call_next(request)
